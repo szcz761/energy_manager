@@ -1,0 +1,28 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+
+# OS/editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/settings.json
+
+# Local secrets and machine-specific config
+deye_client/config.local.py
+smart_life/smart_plug_config.local.json
+smart_life/smart_plug_config.json
+
+# Runtime snapshots / cache payloads
+rce_data/rce_pln_current.json
+smart_life/device_detail.json
+smart_life/device_spec.json
+smart_life/snapshot.json

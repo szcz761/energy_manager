@@ -1,0 +1,7 @@
+{
+    "device_id": "your_device_id",
+    "ip_address": "192.168.0.100",
+    "local_key": "your_local_key",
+    "protocol_version": 3.3,
+    "dps_index": 1
+}
