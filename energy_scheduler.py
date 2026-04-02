@@ -142,7 +142,32 @@ def schedule_manager(time: datetime, task_name: str, extra_args: str = "", scrip
     return run_cmd(cmd)
 
 
+def cleanup_tasks() -> None:
+    """Remove all scheduled energy tasks before creating new ones."""
+    tasks = ["EnergyMorningSell", "EnergyStartCharge", "EnergyStopCharge", "EnergyDailyPlan"]
+    if platform.system() == "Windows":
+        for task in tasks:
+            # /delete /tn "task" /f  - /f forces deletion without confirmation
+            # We ignore errors if the task doesn't exist
+            cmd = f'schtasks /delete /tn "{task}" /f'
+            subprocess.run(cmd, shell=True, capture_output=True)
+    else:
+        # On Linux, we'd need to find jobs in 'at' queue.
+        # This is trickier as 'at' doesn't easily support names.
+        # However, we can try to find them by the script names in the command.
+        try:
+            atq_output = subprocess.check_output(["atq"], text=True)
+            for line in atq_output.splitlines():
+                job_id = line.split()[0]
+                job_content = subprocess.check_output(["at", "-c", job_id], text=True)
+                if "energy_manager.py" in job_content or "energy_scheduler.py" in job_content:
+                    subprocess.run(["atrm", job_id])
+        except Exception as e:
+            logger.warning(f"Failed to cleanup 'at' jobs: {e}")
+
+
 def plan_day() -> None:
+    cleanup_tasks()
     plan = calculate_day_plan()
     now_dt = datetime.now(WARSAW_TZ)
     now = now_dt.isoformat()
