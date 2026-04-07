@@ -296,6 +296,7 @@ def manage_energy_periodic() -> Optional[int]:
             minutes_to_run_again = abs(soc - TRESHOLD_SOC_OFF)
             minutes_to_run_again_2 = abs(soc - TRESHOLD_SOC_OFF)
             minutes_to_run_again = min(minutes_to_run_again, minutes_to_run_again_2)
+            minutes_to_run_again = max(minutes_to_run_again, 2)
         return int(minutes_to_run_again)
     return None
 
