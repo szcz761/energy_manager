@@ -77,12 +77,14 @@ def calculate_day_plan() -> dict[str, Optional[datetime]]:
     found_start = False
     for item in prices:
         dtime = parse_rce_datetime(item["dtime"])
-        # if dtime > now and dtime.date() == now.date():
+        if dtime <= now:
+            continue
+
         price_kwh = float(item.get("rce_pln") or item.get("rce") or 0) / 1000.0
-        if not found_start and price_kwh < TRESHOLD_PRICE_POWER_GAS:
+        if not found_start and price_kwh < TRESHOLD_PRICE_POWER_GAS and dtime.hour > 8:
             plan["start_charge"] = dtime
             found_start = True
-        elif found_start and price_kwh >= TRESHOLD_PRICE_POWER_GAS:
+        elif found_start and price_kwh >= TRESHOLD_PRICE_POWER_GAS and dtime.hour > 14:
             plan["stop_charge"] = dtime
             break
 
@@ -179,14 +181,14 @@ def plan_day() -> None:
             f"Scheduler: Plan for the day ({now_dt.strftime('%Y-%m-%d')}): {json.dumps({k: v.strftime('%H:%M') if v else None for k, v in plan.items()}, indent=2)}"
         )
 
-    if plan["morning_sell"] and plan["morning_sell"].isoformat() > now:
+    if plan["morning_sell"] and plan["morning_sell"] > now_dt:
         schedule_manager(plan["morning_sell"], "EnergyMorningSell")
     else:
         logger.info(
             f"Scheduler: No suitable morning_sell time found or it's already passed. for plan['morning_sell']: {plan['morning_sell'].strftime('%H:%M') if plan['morning_sell'] else None}"
         )
 
-    if plan["start_charge"] and plan["start_charge"].isoformat() > now:
+    if plan["start_charge"] and plan["start_charge"] > now_dt:
         start_str = plan["start_charge"].strftime("%H:%M")
         end_str = plan["stop_charge"].strftime("%H:%M") if plan["stop_charge"] else "20:00"
         schedule_manager(plan["start_charge"], "EnergyStartCharge", f"--period {start_str} {end_str}")
@@ -195,14 +197,14 @@ def plan_day() -> None:
             f"Scheduler: No suitable start_charge time found or it's already passed. for plan['start_charge']: {plan['start_charge'].strftime('%H:%M') if plan['start_charge'] else None}"
         )
 
-    if plan["stop_charge"] and plan["stop_charge"].isoformat() > now:
+    if plan["stop_charge"] and plan["stop_charge"] > now_dt:
         schedule_manager(plan["stop_charge"], "EnergyStopCharge")
     else:
         logger.info(
             f"Scheduler: No suitable stop_charge time found or it's already passed. for plan['stop_charge']: {plan['stop_charge'].strftime('%H:%M') if plan['stop_charge'] else None}"
         )
 
-    if plan["next_sunrise"] and plan["next_sunrise"].isoformat() > now:
+    if plan["next_sunrise"] and plan["next_sunrise"] > now_dt:
         schedule_manager(plan["next_sunrise"], "EnergyDailyPlan", script_path=ENERGY_SCHEDULER)
     else:
         logger.info(
