@@ -204,7 +204,11 @@ def plan_day() -> None:
             f"Scheduler: No suitable stop_charge time found or it's already passed. for plan['stop_charge']: {plan['stop_charge'].strftime('%H:%M') if plan['stop_charge'] else None}"
         )
 
-    if plan["next_sunrise"] and plan["next_sunrise"] > now_dt:
+    if not plan["next_sunrise"]:
+        plan["next_sunrise"] = now_dt + timedelta(days=1, hours=5 - now_dt.hour)
+        logger.info(f"Scheduler: No next_sunrise time found for tomorrow.")
+
+    if plan["next_sunrise"] > now_dt:
         schedule_manager(plan["next_sunrise"], "EnergyDailyPlan", script_path=ENERGY_SCHEDULER)
     else:
         logger.info(

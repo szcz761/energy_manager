@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 # --- Constants / Variables ---
 PROJECT_ROOT: str = os.path.dirname(os.path.abspath(__file__))
-SUNNY_CLOUD_THRESHOLD: int = 60  # % cloud cover
+SUNNY_CLOUD_THRESHOLD: int = 70  # % cloud cover
 SUNNY_RADIATION_THRESHOLD: int = 200  # W/m² (optional extra check)
 PRICE_DROP_PERCENTAGE: float = 0.7  # 70% drop from morning peak towards daily min
 MIN_SELL_PRICE: float = 0.39  # PLN/kWh - Minimum price to sell energy
