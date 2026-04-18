@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 
+from CONFIG import *
 from deye_client.auth import DeyeCloudAPI
 from deye_client.data_retriever import DeyeCloudDataRetriever
 from deye_client.config import CONFIG as DEYE_CONFIG
@@ -23,13 +24,17 @@ from deye_client.check_heater import (
 
 PYTHON_EXE = sys.executable
 # from energy_scheduler import PYTHON_EXE
-from meteo.open_meteo import fetch_weather_forecast, is_sunny_day
-from rce_data.fetch_rce_pln import WARSAW_TZ, fetch_all_from_now
+from meteo.open_meteo import fetch_weather_forecast, how_sunny_day
+from rce_data.fetch_rce_pln import fetch_all_from_now
 from smart_life.heater_control import (
     SmartLifePlug,
     load_config as load_smart_life_config,
     DEFAULT_CONFIG_PATH as SMART_LIFE_CONFIG_PATH,
 )
+
+from zoneinfo import ZoneInfo
+
+WARSAW_TZ = ZoneInfo(TIMEZONE)
 
 
 # Configure logging
@@ -57,15 +62,9 @@ GAS_PRICE = 0.20426  # "Gas fuel" line item
 DYSTRYBUTION_GAS = 0.05388  # "Variable distribution" line item
 VAT = 1.23  # current VAT rate
 EFITENSY_HEATING_GAS = 0.80  # keep 0.80 or adjust based on boiler specification
-
 # Calculation:
-PRICE_POWER_I_BUY = 1.38  # current electricity buy price
 PRICE_HEAT_FROM_GAS = (GAS_PRICE + DYSTRYBUTION_GAS) * VAT / EFITENSY_HEATING_GAS
-TRESHOLD_PRICE_POWER_GAS = PRICE_HEAT_FROM_GAS * 0.99  # around PLN 0.39 / kWh
-
-TRESHOLD_SOC_ON = 98
-TRESHOLD_SOC_OFF = 90
-TRESHOLD_PV_POWER = 500
+# TRESHOLD_PRICE_POWER_GAS = PRICE_HEAT_FROM_GAS * 0.99  # that is 0.39
 
 
 def get_deye_data() -> Tuple[Optional[float], Optional[float], Optional[str]]:
@@ -222,13 +221,27 @@ def manage_energy() -> Optional[float]:
         logger.warning("Inverter data (SOC/PV/SN) missing. Cannot make full decision.")
         return soc
 
-    manage_sell_power(rce_price_kwh)
-    manage_heater_on_off(soc, pv_power, rce_price_kwh)
+    treshold_price = calculate_threshold_based_on_weather()
+    manage_sell_power(rce_price_kwh, treshold_price)
+    manage_heater_on_off(soc, pv_power, rce_price_kwh, treshold_price)
     return soc
 
 
-def manage_sell_power(rce_price_kwh):
-    weather_data = fetch_weather_forecast()
+def calculate_threshold_based_on_weather() -> float:
+    weather_data = fetch_weather_forecast(LAT, LON, TIMEZONE)
+    cloud_cover = how_sunny_day(weather_data)
+    treshold_price = TRESHOLD_PRICE_POWER_GAS
+    if cloud_cover < VERY_SUNNY_CLOUD_THRESHOLD:
+        treshold_price = TRESHOLD_PRICE_POWER_GAS - UNDER_TRHESHOLD_FOR_LONGER_SELL
+    elif cloud_cover > SUNNY_CLOUD_THRESHOLD:
+        treshold_price = PRICE_POWER_I_BUY
+    logger.info(
+        f"Calculated threshold price based on weather: {treshold_price:.4f} PLN/kWh (Cloud cover: {cloud_cover:.1f}%)"
+    )
+    return treshold_price
+
+
+def manage_sell_power(rce_price_kwh, treshold_price):
     api: DeyeCloudAPI = DeyeCloudAPI(region=DEYE_CONFIG.get("REGION", "eu"))
     api.obtain_token(
         app_id=DEYE_CONFIG.get("APP_ID", ""),
@@ -238,10 +251,8 @@ def manage_sell_power(rce_price_kwh):
     )
     retriever = DeyeCloudDataRetriever(api)
 
-    if is_sunny_day(weather_data) and datetime.now().hour < 12 and rce_price_kwh > TRESHOLD_PRICE_POWER_GAS:
-        logger.info(
-            f"Price {rce_price_kwh:.4f} > Threshold {TRESHOLD_PRICE_POWER_GAS:.4f}. Setting Deye to 'SELLING_FIRST'."
-        )
+    if datetime.now().hour < 12 and rce_price_kwh > treshold_price:
+        logger.info(f"Price {rce_price_kwh:.4f} > Threshold {treshold_price:.4f}. Setting Deye to 'SELLING_FIRST'.")
         resp = retriever.set_system_work_mode("SELLING_FIRST")
         if not resp or resp.get("success") is not True:
             logger.warning(
@@ -249,7 +260,7 @@ def manage_sell_power(rce_price_kwh):
             )
     else:
         logger.info(
-            f"Price {rce_price_kwh:.4f} <= Threshold {TRESHOLD_PRICE_POWER_GAS:.4f}. or Not a sunny day. Setting Deye to 'ZERO_EXPORT_TO_CT'."
+            f"Price {rce_price_kwh:.4f} <= Threshold {treshold_price:.4f}. or Not a sunny day. Setting Deye to 'ZERO_EXPORT_TO_CT'."
         )
         resp = retriever.set_system_work_mode("ZERO_EXPORT_TO_CT")
         if not resp or resp.get("success") is not True:
@@ -258,7 +269,7 @@ def manage_sell_power(rce_price_kwh):
             )
 
 
-def manage_heater_on_off(soc, pv_power, rce_price_kwh):
+def manage_heater_on_off(soc, pv_power, rce_price_kwh, treshold_price):
     try:
         smart_life_config = load_smart_life_config(SMART_LIFE_CONFIG_PATH)
         plug = SmartLifePlug(smart_life_config)
@@ -266,11 +277,7 @@ def manage_heater_on_off(soc, pv_power, rce_price_kwh):
         logger.info(f"Current heater state: {'ON' if is_heater_on else 'OFF'}")
 
         if not is_heater_on:
-            if (
-                (pv_power > TRESHOLD_PV_POWER)
-                and (soc >= TRESHOLD_SOC_ON)
-                and (rce_price_kwh < TRESHOLD_PRICE_POWER_GAS)
-            ):
+            if (pv_power > TRESHOLD_PV_POWER) and (soc >= TRESHOLD_SOC_ON) and (rce_price_kwh < treshold_price):
                 logger.info("Conditions MET. Turning ON the heater.")
                 plug.turn_on()
             else:

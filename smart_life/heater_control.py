@@ -15,6 +15,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import tinytuya
+import logging
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("smart_plug_config.local.json")
@@ -48,7 +52,24 @@ class SmartPlugConfig:
     def from_file(cls, path: Path) -> "SmartPlugConfig":
         with path.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
-        return cls.from_mapping(data)
+        config = cls.from_mapping(data)
+        config._path = path  # Store path for potential updates
+        return config
+
+    def save(self) -> None:
+        """Saves the current configuration back to the file it was loaded from."""
+        path = getattr(self, "_path", None)
+        if not path:
+            return
+        data = {
+            "device_id": self.device_id,
+            "ip_address": self.ip_address,
+            "local_key": self.local_key,
+            "protocol_version": self.protocol_version,
+            "dps_index": self.dps_index,
+        }
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=4)
 
 
 class SmartLifePlug:
@@ -63,21 +84,61 @@ class SmartLifePlug:
         retry_delay: int = 5,
     ) -> None:
         self.config = config
+        self._retry_limit = retry_limit
+        self._retry_delay = retry_delay
+        self._persist = persist
+        self._init_device()
+
+    def _init_device(self) -> None:
         self._device = tinytuya.OutletDevice(
-            dev_id=config.device_id,
-            address=config.ip_address,
-            local_key=config.local_key,
-            version=config.protocol_version,
+            dev_id=self.config.device_id,
+            address=self.config.ip_address,
+            local_key=self.config.local_key,
+            version=self.config.protocol_version,
         )
-        self._device.set_socketRetryLimit(retry_limit)
-        self._device.set_socketRetryDelay(retry_delay)
-        if persist:
+        self._device.set_socketRetryLimit(self._retry_limit)
+        self._device.set_socketRetryDelay(self._retry_delay)
+        if self._persist:
             self._device.set_socketPersistent(True)
 
+    def discover_ip(self) -> bool:
+        """Tries to find the device on the network and update its IP."""
+        logger.info(f"Attempting to discover device {self.config.device_id}...")
+        devices = tinytuya.deviceScan()
+        for ip, dev in devices.items():
+            if dev.get("gwId") == self.config.device_id:
+                logger.info(f"Found device at {ip}. Updating configuration.")
+                self.config.ip_address = ip
+                self.config.save()
+                self._init_device()
+                return True
+        logger.warning("Device not found during scan.")
+        return False
+
     def get_status_payload(self) -> Dict[str, Any]:
-        payload = self._device.status()
-        if not payload or "dps" not in payload:
-            raise RuntimeError("Device did not return DPS payload.")
+        try:
+            payload = self._device.status()
+        except Exception:
+            payload = None
+
+        if not payload or payload.get("Err"):
+            # If failed, try to discover the IP once
+            if self.discover_ip():
+                payload = self._device.status()
+
+        if not payload:
+            raise RuntimeError("Brak odpowiedzi od urządzenia.")
+
+        if isinstance(payload, dict) and payload.get("Err"):
+            raise RuntimeError(
+                f"TinyTuya Err={payload.get('Err')}, "
+                f"Error={payload.get('Error')}, "
+                f"Payload={payload.get('Payload')}"
+            )
+
+        if "dps" not in payload:
+            raise RuntimeError(f"Brak DPS w odpowiedzi: {payload!r}")
+
         return payload
 
     def is_on(self) -> bool:

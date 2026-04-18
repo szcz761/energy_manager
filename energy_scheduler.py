@@ -27,10 +27,11 @@ stream_handler.setLevel(logging.INFO)
 logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
 logger = logging.getLogger(__name__)
 
-from energy_manager import TRESHOLD_PRICE_POWER_GAS, run_cmd
+from CONFIG import *
+from energy_manager import calculate_threshold_based_on_weather, run_cmd
 from rce_data.fetch_rce_pln import fetch_all_from_now, parse_rce_datetime
 
-WARSAW_TZ = ZoneInfo("Europe/Warsaw")
+WARSAW_TZ = ZoneInfo(TIMEZONE)
 PYTHON_EXE = sys.executable
 ENERGY_MANAGER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "energy_manager.py")
 ENERGY_SCHEDULER = os.path.abspath(__file__)
@@ -74,6 +75,7 @@ def calculate_day_plan() -> dict[str, Optional[datetime]]:
         plan["morning_sell"] = peak_time - timedelta(minutes=30)
 
     # 2 & 3. Threshold crossings
+    calculated_treshold = calculate_threshold_based_on_weather()
     found_start = False
     for item in prices:
         dtime = parse_rce_datetime(item["dtime"])
@@ -81,10 +83,10 @@ def calculate_day_plan() -> dict[str, Optional[datetime]]:
             continue
 
         price_kwh = float(item.get("rce_pln") or item.get("rce") or 0) / 1000.0
-        if not found_start and price_kwh < TRESHOLD_PRICE_POWER_GAS and dtime.hour > 8:
+        if not found_start and price_kwh < calculated_treshold and dtime.hour > 8:
             plan["start_charge"] = dtime
             found_start = True
-        elif found_start and price_kwh >= TRESHOLD_PRICE_POWER_GAS and dtime.hour > 14:
+        elif found_start and price_kwh >= calculated_treshold and dtime.hour > 14:
             plan["stop_charge"] = dtime
             break
 
@@ -93,9 +95,7 @@ def calculate_day_plan() -> dict[str, Optional[datetime]]:
 
 def get_sunrise_sunset(date: datetime) -> tuple[Optional[datetime], Optional[datetime]]:
     """Fetch sunrise and sunset times for a specific date using Open-Meteo."""
-    # LAT and LON are defined in meteo/open_meteo.py but we can use them here if we import or re-define.
-    # Let's import from meteo.open_meteo
-    from meteo.open_meteo import LAT, LON
+    # LAT, LON, TIMEZONE are imported from CONFIG
 
     params = {
         "latitude": LAT,
@@ -116,8 +116,8 @@ def get_sunrise_sunset(date: datetime) -> tuple[Optional[datetime], Optional[dat
         sunrise_str = daily.get("sunrise", [None])[0]
         sunset_str = daily.get("sunset", [None])[0]
 
-        sunrise = datetime.fromisoformat(sunrise_str).replace(tzinfo=ZoneInfo("Europe/Warsaw")) if sunrise_str else None
-        sunset = datetime.fromisoformat(sunset_str).replace(tzinfo=ZoneInfo("Europe/Warsaw")) if sunset_str else None
+        sunrise = datetime.fromisoformat(sunrise_str).replace(tzinfo=ZoneInfo(TIMEZONE)) if sunrise_str else None
+        sunset = datetime.fromisoformat(sunset_str).replace(tzinfo=ZoneInfo(TIMEZONE)) if sunset_str else None
 
         return sunrise, sunset
     except Exception as e:
