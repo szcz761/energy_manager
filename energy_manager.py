@@ -67,120 +67,125 @@ PRICE_HEAT_FROM_GAS = (GAS_PRICE + DYSTRYBUTION_GAS) * VAT / EFITENSY_HEATING_GA
 # TRESHOLD_PRICE_POWER_GAS = PRICE_HEAT_FROM_GAS * 0.99  # that is 0.39
 
 
-def get_deye_data() -> Tuple[Optional[float], Optional[float], Optional[str]]:
+def get_deye_data() -> Tuple[Optional[float], Optional[float]]:
     """Fetches SOC, PV Power and Device SN from Deye Cloud."""
-    api: DeyeCloudAPI = DeyeCloudAPI(region=DEYE_CONFIG.get("REGION", "eu"))
-    ok: bool = api.obtain_token(
-        app_id=DEYE_CONFIG.get("APP_ID", ""),
-        app_secret=DEYE_CONFIG.get("APP_SECRET", ""),
-        email=DEYE_CONFIG.get("EMAIL", ""),
-        password=DEYE_CONFIG.get("PASSWORD", ""),
-    )
-    if not ok:
-        logger.error("Deye authentication failed")
-        return None, None, None
+    try:
+        api: DeyeCloudAPI = DeyeCloudAPI(region=DEYE_CONFIG.get("REGION", "eu"))
+        ok: bool = api.obtain_token(
+            app_id=DEYE_CONFIG.get("APP_ID", ""),
+            app_secret=DEYE_CONFIG.get("APP_SECRET", ""),
+            email=DEYE_CONFIG.get("EMAIL", ""),
+            password=DEYE_CONFIG.get("PASSWORD", ""),
+        )
+        if not ok:
+            logger.error("Deye authentication failed")
+            return 0, 0
 
-    retriever: DeyeCloudDataRetriever = DeyeCloudDataRetriever(api)
+        retriever: DeyeCloudDataRetriever = DeyeCloudDataRetriever(api)
 
-    device_sn: Optional[str] = None
-    soc_fallback: Optional[float] = None
-    pv_fallback: Optional[float] = None
+        device_sn: Optional[str] = None
+        soc_fallback: Optional[float] = None
+        pv_fallback: Optional[float] = None
 
-    # 2. Fallback to station list
-    stations_response: Optional[Dict[str, Any]] = retriever.get_station_list()
-    stations: List[Any] = []
-    if stations_response:
-        stations = stations_response.get("stationList") or stations_response.get("data") or []
+        # 2. Fallback to station list
+        stations_response: Optional[Dict[str, Any]] = retriever.get_station_list()
+        stations: List[Any] = []
+        if stations_response:
+            stations = stations_response.get("stationList") or stations_response.get("data") or []
 
-    if not stations:
-        logger.error(f"No stations found either. Response: {stations_response}")
-        return None, None, None
+        if not stations:
+            logger.error(f"No stations found either. Response: {stations_response}")
+            return 0, 0
 
-    first_station: Dict[str, Any] = stations[0]
-    station_id: Any = first_station.get("id")
+        first_station: Dict[str, Any] = stations[0]
+        station_id: Any = first_station.get("id")
 
-    # Check if station list entry has SN
-    device_sn = str(first_station.get("deviceSn") or first_station.get("sn") or "")
+        # Check if station list entry has SN
+        device_sn = str(first_station.get("deviceSn") or first_station.get("sn") or "")
 
-    # Extract values directly from station record as fallback
-    soc_fallback = _to_float(first_station.get("batterySOC"))
-    pv_fallback = _to_float(first_station.get("generationPower"))
+        # Extract values directly from station record as fallback
+        soc_fallback = _to_float(first_station.get("batterySOC"))
+        pv_fallback = _to_float(first_station.get("generationPower"))
 
-    # 3. Get station latest data
-    station_data_response: Optional[Dict[str, Any]] = retriever.get_station_latest_data(station_id)
-    if not station_data_response:
-        logger.error(f"Failed to get data for station {station_id}")
-        # If we already have device_sn from station list, we can still continue to step 5
-        if not device_sn:
-            return soc_fallback, pv_fallback, device_sn
-    else:
-        station_data: Dict[str, Any] = station_data_response.get("data") or {}
+        # 3. Get station latest data
+        station_data_response: Optional[Dict[str, Any]] = retriever.get_station_latest_data(station_id)
+        if not station_data_response:
+            logger.error(f"Failed to get data for station {station_id}")
+            # If we already have device_sn from station list, we can still continue to step 5
+            if not device_sn:
+                return soc_fallback, pv_fallback
+        else:
+            station_data: Dict[str, Any] = station_data_response.get("data") or {}
 
-        # 4. Check if station data contains a device SN
-        if not device_sn:
-            device_sn = str(station_data.get("deviceSn") or station_data.get("sn") or "")
+            # 4. Check if station data contains a device SN
+            if not device_sn:
+                device_sn = str(station_data.get("deviceSn") or station_data.get("sn") or "")
 
-        # If station record doesn't include device SN, try station/device endpoint
-        if not device_sn:
-            station_devices_resp = retriever.get_station_devices([station_id])
-            devices_list = []
-            if station_devices_resp:
-                devices_list = (
-                    station_devices_resp.get("deviceList")
-                    or station_devices_resp.get("data")
-                    or station_devices_resp.get("deviceListItems")
-                    or []
-                )
-            if isinstance(devices_list, list) and devices_list:
-                first_dev = devices_list[0]
-                device_sn = str(first_dev.get("deviceSn") or first_dev.get("sn") or "")
+            # If station record doesn't include device SN, try station/device endpoint
+            if not device_sn:
+                station_devices_resp = retriever.get_station_devices([station_id])
+                devices_list = []
+                if station_devices_resp:
+                    devices_list = (
+                        station_devices_resp.get("deviceList")
+                        or station_devices_resp.get("data")
+                        or station_devices_resp.get("deviceListItems")
+                        or []
+                    )
+                if isinstance(devices_list, list) and devices_list:
+                    first_dev = devices_list[0]
+                    device_sn = str(first_dev.get("deviceSn") or first_dev.get("sn") or "")
 
-        if not device_sn:
-            # Try to extract SOC/PV directly from station data as fallback
-            logger.info("No device SN in station data, attempting to extract values directly.")
-            soc: Optional[float] = None
-            pv_power: Optional[float] = None
+            if not device_sn:
+                # Try to extract SOC/PV directly from station data as fallback
+                logger.info("No device SN in station data, attempting to extract values directly.")
+                soc: Optional[float] = None
+                pv_power: Optional[float] = None
 
-            for key in POSSIBLE_SOC_KEYS:
-                if key in station_data:
-                    soc = _to_float(station_data[key])
-                    if soc is not None:
-                        break
+                for key in POSSIBLE_SOC_KEYS:
+                    if key in station_data:
+                        soc = _to_float(station_data[key])
+                        if soc is not None:
+                            break
 
-            for key in POSSIBLE_PV_KEYS:
-                if key in station_data:
-                    pv_power = _to_float(station_data[key])
-                    if pv_power is not None:
-                        break
+                for key in POSSIBLE_PV_KEYS:
+                    if key in station_data:
+                        pv_power = _to_float(station_data[key])
+                        if pv_power is not None:
+                            break
 
-            # Use fallbacks if station_data didn't have them
-            soc = soc if soc is not None else soc_fallback
-            pv_power = pv_power if pv_power is not None else pv_fallback
+                # Use fallbacks if station_data didn't have them
+                soc = soc if soc is not None else soc_fallback
+                pv_power = pv_power if pv_power is not None else pv_fallback
 
-            if soc is not None or pv_power is not None:
-                logger.info(f"Extracted from station: SOC={soc}%, PV={pv_power}W")
-                return soc, pv_power, device_sn
+                if soc is not None or pv_power is not None:
+                    logger.info(f"Extracted from station: SOC={soc}%, PV={pv_power}W")
+                    return soc, pv_power
 
-            logger.error(f"Could not find device SN or data in station. Keys: {list(station_data.keys())}")
-            return None, None, None
+                logger.error(f"Could not find device SN or data in station. Keys: {list(station_data.keys())}")
+                return 0, 0
 
-    # 5. Get latest data for the found device SN
-    latest_response: Optional[Dict[str, Any]] = retriever.get_device_latest_data(device_sn)
-    soc, pv_power = extract_values_from_latest(latest_response)
+        # 5. Get latest data for the found device SN
+        latest_response: Optional[Dict[str, Any]] = retriever.get_device_latest_data(device_sn)
+        soc, pv_power = extract_values_from_latest(latest_response)
 
-    # Use fallbacks if latest data is missing
-    if soc is None and soc_fallback is not None:
-        soc = soc_fallback
-    if pv_power is None and pv_fallback is not None:
-        pv_power = pv_fallback
+        # Use fallbacks if latest data is missing
+        if soc is None and soc_fallback is not None:
+            soc = soc_fallback
+        if pv_power is None and pv_fallback is not None:
+            pv_power = pv_fallback
 
-    if soc is None or pv_power is None:
-        logger.warning(f"Could not extract SOC/PV from device {device_sn} latest data. Response: {latest_response}")
-        # Final attempt: maybe station data has it and we haven't checked yet (if we came from device list)
-        # But if we have a device SN, the device latest data should be the source of truth.
+        if soc is None or pv_power is None:
+            logger.warning(f"Could not extract SOC/PV from device {device_sn} latest data. Response: {latest_response}")
+            # Final attempt: maybe station data has it and we haven't checked yet (if we came from device list)
+            # But if we have a device SN, the device latest data should be the source of truth.
 
-    logger.info(f"Deye Data - Device: {device_sn}, SOC: {soc}%, PV Power: {pv_power}W")
-    return soc, pv_power, device_sn
+        logger.info(f"Deye Data - Device: {device_sn}, SOC: {soc}%, PV Power: {pv_power}W")
+        return soc, pv_power
+
+    except Exception as e:
+        logger.error(f"Error in get_deye_data: {e}")
+        return 0, 0
 
 
 def get_current_rce_price() -> Optional[float]:
@@ -189,7 +194,7 @@ def get_current_rce_price() -> Optional[float]:
         items, _ = fetch_all_from_now()
         if not items:
             logger.warning("No RCE price data available for the current time")
-            return None
+            return 0
 
         # The first item should be the current/closest future price
         # fetch_all_from_now filters for dtime >= now
@@ -197,7 +202,7 @@ def get_current_rce_price() -> Optional[float]:
         current_price_str: Any = current_item.get("rce_pln") or current_item.get("rce")
         if current_price_str is None:
             logger.warning(f"RCE field missing in data. Keys: {list(current_item.keys())}")
-            return None
+            return 0
 
         price_mwh: float = float(current_price_str)
         price_kwh: float = price_mwh / 1000.0
@@ -205,23 +210,16 @@ def get_current_rce_price() -> Optional[float]:
         return price_kwh
     except Exception as e:
         logger.error(f"Error fetching RCE price: {e}")
-        return None
+        return 0
 
 
 def manage_energy() -> Optional[float]:
     """Main entry for legacy/standalone energy management."""
-    soc, pv_power, device_sn = get_deye_data()
+    soc, pv_power = get_deye_data()
+
     rce_price_kwh = get_current_rce_price()
-
-    if rce_price_kwh is None:
-        logger.error("Could not fetch RCE price. Aborting energy management.")
-        return None
-
-    if soc is None or pv_power is None or device_sn is None:
-        logger.warning("Inverter data (SOC/PV/SN) missing. Cannot make full decision.")
-        return soc
-
     treshold_price = calculate_threshold_based_on_weather()
+
     manage_sell_power(rce_price_kwh, treshold_price)
     manage_heater_on_off(soc, pv_power, rce_price_kwh, treshold_price)
     return soc
@@ -242,31 +240,34 @@ def calculate_threshold_based_on_weather() -> float:
 
 
 def manage_sell_power(rce_price_kwh, treshold_price):
-    api: DeyeCloudAPI = DeyeCloudAPI(region=DEYE_CONFIG.get("REGION", "eu"))
-    api.obtain_token(
-        app_id=DEYE_CONFIG.get("APP_ID", ""),
-        app_secret=DEYE_CONFIG.get("APP_SECRET", ""),
-        email=DEYE_CONFIG.get("EMAIL", ""),
-        password=DEYE_CONFIG.get("PASSWORD", ""),
-    )
-    retriever = DeyeCloudDataRetriever(api)
-
-    if datetime.now().hour < 12 and rce_price_kwh > treshold_price:
-        logger.info(f"Price {rce_price_kwh:.4f} > Threshold {treshold_price:.4f}. Setting Deye to 'SELLING_FIRST'.")
-        resp = retriever.set_system_work_mode("SELLING_FIRST")
-        if not resp or resp.get("success") is not True:
-            logger.warning(
-                "set_system_work_mode did not report success; not attempting /order/battery/modeControl as it's for battery charge-mode actions."
-            )
-    else:
-        logger.info(
-            f"Price {rce_price_kwh:.4f} <= Threshold {treshold_price:.4f}. or Not a sunny day. Setting Deye to 'ZERO_EXPORT_TO_CT'."
+    try:
+        api: DeyeCloudAPI = DeyeCloudAPI(region=DEYE_CONFIG.get("REGION", "eu"))
+        api.obtain_token(
+            app_id=DEYE_CONFIG.get("APP_ID", ""),
+            app_secret=DEYE_CONFIG.get("APP_SECRET", ""),
+            email=DEYE_CONFIG.get("EMAIL", ""),
+            password=DEYE_CONFIG.get("PASSWORD", ""),
         )
-        resp = retriever.set_system_work_mode("ZERO_EXPORT_TO_CT")
-        if not resp or resp.get("success") is not True:
-            logger.warning(
-                "set_system_work_mode did not report success; not attempting /order/battery/modeControl as it's for battery charge-mode actions."
+        retriever = DeyeCloudDataRetriever(api)
+
+        if datetime.now().hour < 12 and rce_price_kwh > treshold_price:
+            logger.info(f"Price {rce_price_kwh:.4f} > Threshold {treshold_price:.4f}. Setting Deye to 'SELLING_FIRST'.")
+            resp = retriever.set_system_work_mode("SELLING_FIRST")
+            if not resp or resp.get("success") is not True:
+                logger.warning(
+                    "set_system_work_mode did not report success; not attempting /order/battery/modeControl as it's for battery charge-mode actions."
+                )
+        else:
+            logger.info(
+                f"Price {rce_price_kwh:.4f} <= Threshold {treshold_price:.4f}. or Not a sunny day. Setting Deye to 'ZERO_EXPORT_TO_CT'."
             )
+            resp = retriever.set_system_work_mode("ZERO_EXPORT_TO_CT")
+            if not resp or resp.get("success") is not True:
+                logger.warning(
+                    "set_system_work_mode did not report success; not attempting /order/battery/modeControl as it's for battery charge-mode actions."
+                )
+    except Exception as e:
+        logger.error(f"Error managing sell power: {e}")
 
 
 def manage_heater_on_off(soc, pv_power, rce_price_kwh, treshold_price):

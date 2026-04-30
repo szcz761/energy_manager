@@ -33,7 +33,7 @@ def how_sunny_day(weather_data: dict) -> float:
     """Check if it's sunny for the entire day (7 AM to 6 PM) and return average cloud cover."""
     if not weather_data or "hourly" not in weather_data:
         logger.warning("No weather data available for sunniness check.")
-        return 100.0
+        return 50.0
 
     hourly = weather_data["hourly"]
     times = hourly["time"]
@@ -46,7 +46,7 @@ def how_sunny_day(weather_data: dict) -> float:
             relevant_clouds.append(cloud)
 
     if not relevant_clouds:
-        return 100.0
+        return 50.0
 
     avg_cloud = sum(relevant_clouds) / len(relevant_clouds)
     logger.info(f"Average cloud cover for the day (07-18): {avg_cloud:.1f}%")
