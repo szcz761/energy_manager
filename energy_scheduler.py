@@ -168,6 +168,35 @@ def cleanup_tasks() -> None:
             logger.warning(f"Failed to cleanup 'at' jobs: {e}")
 
 
+def schedule_fallback() -> None:
+    """Schedule fixed fallback times when normal planning fails.
+
+    Schedules energy_manager at 06:00, 11:00, 17:00 (skipping times already passed)
+    and energy_scheduler at 04:00 the next morning.
+    """
+    logger.warning("Scheduler: Applying fallback schedule.")
+    now_dt = datetime.now(WARSAW_TZ)
+    today = now_dt.date()
+    tomorrow = today + timedelta(days=1)
+
+    fallback_manager_times = [
+        (datetime(today.year, today.month, today.day, 6, 0, tzinfo=WARSAW_TZ), "EnergyFallback_06"),
+        (datetime(today.year, today.month, today.day, 11, 0, tzinfo=WARSAW_TZ), "EnergyFallback_11"),
+        (datetime(today.year, today.month, today.day, 17, 0, tzinfo=WARSAW_TZ), "EnergyFallback_17"),
+    ]
+
+    for run_time, task_name in fallback_manager_times:
+        if run_time > now_dt:
+            schedule_manager(run_time, task_name)
+            logger.info(f"Scheduler: Fallback - scheduled energy_manager at {run_time.strftime('%H:%M')}")
+        else:
+            logger.info(f"Scheduler: Fallback - skipping {run_time.strftime('%H:%M')} (already passed)")
+
+    next_run = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 4, 0, tzinfo=WARSAW_TZ)
+    schedule_manager(next_run, "EnergyDailyPlan", script_path=ENERGY_SCHEDULER)
+    logger.info(f"Scheduler: Fallback - scheduled scheduler re-run at {next_run.strftime('%Y-%m-%d %H:%M')}")
+
+
 def plan_day() -> None:
     cleanup_tasks()
     plan = calculate_day_plan()
@@ -218,7 +247,14 @@ def plan_day() -> None:
 
 def main() -> None:
     logger.info(f"######### Starting Energy Scheduler ##########")
-    plan_day()
+    try:
+        plan_day()
+    except Exception as e:
+        logger.error(f"Scheduler: plan_day() failed: {e}", exc_info=True)
+        try:
+            schedule_fallback()
+        except Exception as fb_e:
+            logger.error(f"Scheduler: schedule_fallback() also failed: {fb_e}", exc_info=True)
 
 
 if __name__ == "__main__":

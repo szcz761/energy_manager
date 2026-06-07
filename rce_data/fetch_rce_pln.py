@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import ssl
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -20,7 +21,10 @@ def parse_rce_datetime(value: str) -> datetime:
 
 def read_json(url: str) -> dict[str, Any]:
     request: Request = Request(url, headers={"accept": "application/json"})
-    with urlopen(request, timeout=30) as response:
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    with urlopen(request, timeout=30, context=ssl_ctx) as response:
         payload: dict[str, Any] = json.loads(response.read().decode("utf-8"))
     return payload
 
@@ -59,12 +63,8 @@ def fetch_all_from_now() -> tuple[list[dict[str, Any]], str]:
 
     search_start_str: str = search_start.strftime("%Y-%m-%d %H:%M:%S")
 
-    query: dict[str, str] = {
-        "$filter": f"dtime ge '{search_start_str}'",
-        "$orderby": "dtime asc",
-        "$first": "500",
-    }
-    first_url: str = f"{API_URL}?{urlencode(query)}"
+    filter_expr: str = quote(f"dtime ge '{search_start_str}'")
+    first_url: str = f"{API_URL}?$filter={filter_expr}&$orderby=dtime%20asc&$first=500"
 
     all_items: list[dict[str, Any]] = []
     next_url: str | None = first_url
