@@ -18,6 +18,7 @@ Thumbs.db
 
 # Local secrets and machine-specific config
 deye_client/config.local.py
+deye_client/config.local.json
 smart_life/smart_plug_config.local.json
 smart_life/smart_plug_config.json
 

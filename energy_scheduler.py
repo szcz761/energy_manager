@@ -1,18 +1,30 @@
+"""
+Energy Scheduler - planuje uruchomienia energy_manager.
+
+Uruchamiany raz dziennie o wschodzie słońca.
+Planuje 3 zadania:
+1. Morning sell - pojedyncze, 1h przed porannym pikiem
+2. Midday periodic - gdy cena spada < próg (start okresu grzałki)
+3. Evening periodic - 1h przed wieczornym pikiem
+"""
 from __future__ import annotations
+
 import argparse
+import json
 import logging
 import os
 import platform
+import shlex
 import subprocess
 import sys
-import json
-import shlex
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
-from typing import Optional, Any
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-# Configure logging
+from CONFIG import *
+
+# === Logging ===
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "energy_automation.log")
 log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] (Scheduler) %(message)s")
 
@@ -27,234 +39,226 @@ stream_handler.setLevel(logging.INFO)
 logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
 logger = logging.getLogger(__name__)
 
-from CONFIG import *
-from energy_manager import calculate_threshold_based_on_weather, run_cmd
-from rce_data.fetch_rce_pln import fetch_all_from_now, parse_rce_datetime
-
+# === Paths ===
 WARSAW_TZ = ZoneInfo(TIMEZONE)
 PYTHON_EXE = sys.executable
 ENERGY_MANAGER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "energy_manager.py")
 ENERGY_SCHEDULER = os.path.abspath(__file__)
+SUMMER_HEATER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "summer_heater.py")
+
+TASK_NAMES = ["EnergyMorningSell", "EnergyMiddayPeriodic", "EnergyEveningPeriodic", "EnergyDailyPlan", "EnergyPeriodicCheck", "SummerHeaterOn", "SummerHeaterOff", "SummerHeaterPlan"]
 
 
-def get_price_forecast() -> list[dict[str, Any]]:
-    """Fetch all available RCE price data from now into the future."""
+def run_cmd(cmd: str) -> bool:
+    """Wykonuje komendę."""
+    logger.info(f"Exec: {cmd}")
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        return result.returncode == 0
+    except Exception as e:
+        logger.error(f"Cmd failed: {e}")
+        return False
+
+
+def cleanup_tasks() -> None:
+    """Usuwa zaplanowane taski."""
+    if platform.system() == "Windows":
+        for task in TASK_NAMES:
+            subprocess.run(f'schtasks /delete /tn "{task}" /f', shell=True, capture_output=True)
+    else:
+        try:
+            atq = subprocess.check_output(["atq"], text=True)
+            for line in atq.splitlines():
+                job_id = line.split()[0]
+                content = subprocess.check_output(["at", "-c", job_id], text=True)
+                if "energy_manager.py" in content or "energy_scheduler.py" in content:
+                    subprocess.run(["atrm", job_id])
+        except:
+            pass
+
+
+def schedule_task(run_time: datetime, task_name: str, script: str = None, args: str = "") -> bool:
+    """Planuje task."""
+    target = script or ENERGY_MANAGER
+    
+    if platform.system() == "Windows":
+        tr = f'"{PYTHON_EXE}" "{target}" {args}'.strip()
+        cmd = f'schtasks /create /sc once /tn "{task_name}" /tr "{tr}" /st {run_time.strftime("%H:%M")} /sd {run_time.strftime("%d/%m/%Y")} /f'
+    else:
+        tr = f"{shlex.quote(PYTHON_EXE)} {shlex.quote(target)} {args}".strip()
+        cmd = f"echo {shlex.quote(tr)} | at {run_time.strftime('%H:%M %Y-%m-%d')}"
+    
+    return run_cmd(cmd)
+
+
+def get_sunrise(date: datetime) -> Optional[datetime]:
+    """Pobiera wschód słońca."""
+    import requests
+    try:
+        resp = requests.get("https://api.open-meteo.com/v1/forecast", params={
+            "latitude": LAT, "longitude": LON, "daily": "sunrise",
+            "timezone": "auto", "start_date": date.strftime("%Y-%m-%d"),
+            "end_date": date.strftime("%Y-%m-%d"),
+        }, timeout=10)
+        sunrise_str = resp.json().get("daily", {}).get("sunrise", [None])[0]
+        if sunrise_str:
+            return datetime.fromisoformat(sunrise_str).replace(tzinfo=WARSAW_TZ)
+    except Exception as e:
+        logger.error(f"Sunrise fetch failed: {e}")
+    return None
+
+
+def get_rce_prices() -> list[dict[str, Any]]:
+    """Pobiera ceny RCE."""
+    from rce_data.fetch_rce_pln import fetch_all_from_now
     items, _ = fetch_all_from_now()
     return items
 
 
-def calculate_day_plan() -> dict[str, Optional[datetime]]:
+def get_sell_threshold() -> float:
+    """Stały próg sprzedaży."""
+    return SELL_THRESHOLD
+
+
+def calculate_plan() -> dict[str, Optional[datetime]]:
     """
-    Calculate the 4 key moments for the day:
-    1. morning_sell: 30 mins before highest morning peak (before 12:00)
-    2. start_charge: First crossing of PRICE_THRESHOLD (price goes down)
-    3. stop_charge: Second crossing of PRICE_THRESHOLD (price goes up)
-    4. next_sunrise: Tomorrow's sunrise
+    Oblicza plan dnia na podstawie cen RCE.
+    Jesli API nie dziala, uzywa domyslnych godzin.
     """
-    now = datetime.now(ZoneInfo("Europe/Warsaw"))
-    prices = get_price_forecast()
-    print(f"Fetched {len(prices)} price entries for planning.")
+    from rce_data.fetch_rce_pln import parse_rce_datetime
+    
+    now = datetime.now(WARSAW_TZ)
     tomorrow = now + timedelta(days=1)
-    sunrise_tomorrow, _ = get_sunrise_sunset(tomorrow)
-
-    plan = {"morning_sell": None, "start_charge": None, "stop_charge": None, "next_sunrise": sunrise_tomorrow}
-
-    if not prices:
-        return plan
-
-    # 1. Morning Peak
-    morning_prices = []
-    for item in prices:
-        dtime = parse_rce_datetime(item["dtime"])
-        if dtime.hour < 12 and dtime.hour != 0:
-            price_kwh = float(item.get("rce_pln") or item.get("rce") or 0) / 1000.0
-            morning_prices.append((dtime, price_kwh))
-
-    if morning_prices:
-        peak_time, _ = max(morning_prices, key=lambda x: x[1])
-        plan["morning_sell"] = peak_time - timedelta(minutes=30)
-
-    # 2 & 3. Threshold crossings
-    calculated_treshold = calculate_threshold_based_on_weather()
-    found_start = False
-    for item in prices:
-        dtime = parse_rce_datetime(item["dtime"])
-        if dtime <= now:
-            continue
-
-        price_kwh = float(item.get("rce_pln") or item.get("rce") or 0) / 1000.0
-        if not found_start and price_kwh < calculated_treshold and dtime.hour > 8:
-            plan["start_charge"] = dtime
-            found_start = True
-        elif found_start and price_kwh >= calculated_treshold and dtime.hour > 14:
-            plan["stop_charge"] = dtime
-            break
-
+    threshold = get_sell_threshold()
+    
+    # Domyslne wartosci gdy API nie dziala
+    plan = {
+        "morning_sell": now.replace(hour=6, minute=0, second=0, microsecond=0),
+        "midday_start": now.replace(hour=10, minute=0, second=0, microsecond=0),
+        "evening_start": now.replace(hour=20, minute=0, second=0, microsecond=0),
+        "next_sunrise": datetime(tomorrow.year, tomorrow.month, tomorrow.day, 4, 0, tzinfo=WARSAW_TZ),
+    }
+    
+    # Proba pobrania wschodu slonca
+    sunrise = get_sunrise(tomorrow)
+    if sunrise:
+        plan["next_sunrise"] = sunrise
+    
+    try:
+        prices = get_rce_prices()
+        if not prices:
+            logger.warning("No RCE prices - using default times")
+            return plan
+        
+        # Poranny pik (6-12)
+        morning = [(parse_rce_datetime(p["dtime"]), float(p.get("rce_pln") or p.get("rce") or 0) / 1000)
+                   for p in prices if 6 <= parse_rce_datetime(p["dtime"]).hour < 12 
+                   and parse_rce_datetime(p["dtime"]).date() == now.date()]
+        if morning:
+            peak_time, _ = max(morning, key=lambda x: x[1])
+            plan["morning_sell"] = peak_time - timedelta(hours=1)
+            logger.info(f"Morning peak: {peak_time.strftime('%H:%M')}")
+        
+        # Midday - pierwsza godzina gdy cena < prog (po 10:00)
+        for p in prices:
+            dt = parse_rce_datetime(p["dtime"])
+            price = float(p.get("rce_pln") or p.get("rce") or 0) / 1000
+            if dt.date() == now.date() and dt.hour >= 10 and price < threshold:
+                plan["midday_start"] = dt
+                logger.info(f"Midday start (price < {threshold}): {dt.strftime('%H:%M')} @ {price:.4f}")
+                break
+        
+        # Wieczorny pik (17-24)
+        evening = [(parse_rce_datetime(p["dtime"]), float(p.get("rce_pln") or p.get("rce") or 0) / 1000)
+                   for p in prices if EVENING_PEAK_START_HOUR <= parse_rce_datetime(p["dtime"]).hour < EVENING_PEAK_END_HOUR
+                   and parse_rce_datetime(p["dtime"]).date() == now.date()]
+        if evening:
+            peak_time, _ = max(evening, key=lambda x: x[1])
+            plan["evening_start"] = peak_time - timedelta(hours=1)
+            logger.info(f"Evening peak: {peak_time.strftime('%H:%M')}")
+            
+    except Exception as e:
+        logger.error(f"Plan calculation failed: {e} - using defaults")
+    
     return plan
 
 
-def get_sunrise_sunset(date: datetime) -> tuple[Optional[datetime], Optional[datetime]]:
-    """Fetch sunrise and sunset times for a specific date using Open-Meteo."""
-    # LAT, LON, TIMEZONE are imported from CONFIG
-
-    params = {
-        "latitude": LAT,
-        "longitude": LON,
-        "daily": "sunrise,sunset",
-        "timezone": "auto",
-        "start_date": date.strftime("%Y-%m-%d"),
-        "end_date": date.strftime("%Y-%m-%d"),
-    }
-    try:
-        import requests
-
-        resp = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        daily = data.get("daily", {})
-
-        sunrise_str = daily.get("sunrise", [None])[0]
-        sunset_str = daily.get("sunset", [None])[0]
-
-        sunrise = datetime.fromisoformat(sunrise_str).replace(tzinfo=ZoneInfo(TIMEZONE)) if sunrise_str else None
-        sunset = datetime.fromisoformat(sunset_str).replace(tzinfo=ZoneInfo(TIMEZONE)) if sunset_str else None
-
-        return sunrise, sunset
-    except Exception as e:
-        logger.error(f"Failed to fetch sunrise/sunset: {e}")
-        return None, None
-
-
-def schedule_manager(time: datetime, task_name: str, extra_args: str = "", script_path: Optional[str] = None) -> bool:
-    target_script = script_path if script_path else ENERGY_MANAGER
-    st = time.strftime("%H:%M")
-    sd = time.strftime("%d/%m/%Y")
-
-    if platform.system() == "Windows":
-        tr = f'"{PYTHON_EXE}" "{target_script}" {extra_args}'.strip()
-        cmd = f'schtasks /create /sc once /tn "{task_name}" /tr "{tr}" /st {st} /sd {sd} /f'
-    else:
-        # Use shlex for robust Linux scheduling
-        # target_script should already be absolute path
-        # extra_args might contain multiple arguments, so we split and quote if needed,
-        # but for now we assume they are already formatted or we quote the whole command
-        # Better: if extra_args exists, we can split it.
-        tr = f"{shlex.quote(PYTHON_EXE)} {shlex.quote(target_script)} {extra_args}".strip()
-        cmd = f"echo {shlex.quote(tr)} | at {time.strftime('%H:%M %Y-%m-%d')}"
-    return run_cmd(cmd)
-
-
-def cleanup_tasks() -> None:
-    """Remove all scheduled energy tasks before creating new ones."""
-    tasks = ["EnergyMorningSell", "EnergyStartCharge", "EnergyStopCharge", "EnergyDailyPlan"]
-    if platform.system() == "Windows":
-        for task in tasks:
-            # /delete /tn "task" /f  - /f forces deletion without confirmation
-            # We ignore errors if the task doesn't exist
-            cmd = f'schtasks /delete /tn "{task}" /f'
-            subprocess.run(cmd, shell=True, capture_output=True)
-    else:
-        # On Linux, we'd need to find jobs in 'at' queue.
-        # This is trickier as 'at' doesn't easily support names.
-        # However, we can try to find them by the script names in the command.
-        try:
-            atq_output = subprocess.check_output(["atq"], text=True)
-            for line in atq_output.splitlines():
-                job_id = line.split()[0]
-                job_content = subprocess.check_output(["at", "-c", job_id], text=True)
-                if "energy_manager.py" in job_content or "energy_scheduler.py" in job_content:
-                    subprocess.run(["atrm", job_id])
-        except Exception as e:
-            logger.warning(f"Failed to cleanup 'at' jobs: {e}")
-
-
-def schedule_fallback() -> None:
-    """Schedule fixed fallback times when normal planning fails.
-
-    Schedules energy_manager at 06:00, 11:00, 17:00 (skipping times already passed)
-    and energy_scheduler at 04:00 the next morning.
-    """
-    logger.warning("Scheduler: Applying fallback schedule.")
-    now_dt = datetime.now(WARSAW_TZ)
-    today = now_dt.date()
-    tomorrow = today + timedelta(days=1)
-
-    fallback_manager_times = [
-        (datetime(today.year, today.month, today.day, 6, 0, tzinfo=WARSAW_TZ), "EnergyFallback_06"),
-        (datetime(today.year, today.month, today.day, 11, 0, tzinfo=WARSAW_TZ), "EnergyFallback_11"),
-        (datetime(today.year, today.month, today.day, 17, 0, tzinfo=WARSAW_TZ), "EnergyFallback_17"),
-    ]
-
-    for run_time, task_name in fallback_manager_times:
-        if run_time > now_dt:
-            schedule_manager(run_time, task_name)
-            logger.info(f"Scheduler: Fallback - scheduled energy_manager at {run_time.strftime('%H:%M')}")
-        else:
-            logger.info(f"Scheduler: Fallback - skipping {run_time.strftime('%H:%M')} (already passed)")
-
-    next_run = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 4, 0, tzinfo=WARSAW_TZ)
-    schedule_manager(next_run, "EnergyDailyPlan", script_path=ENERGY_SCHEDULER)
-    logger.info(f"Scheduler: Fallback - scheduled scheduler re-run at {next_run.strftime('%Y-%m-%d %H:%M')}")
-
-
 def plan_day() -> None:
+    """Glowna funkcja planowania."""
     cleanup_tasks()
-    plan = calculate_day_plan()
-    now_dt = datetime.now(WARSAW_TZ)
-    now = now_dt.isoformat()
-    if not plan:
-        logger.error("Scheduler: No plan received.")
+    
+    plan = calculate_plan()
+    now = datetime.now(WARSAW_TZ)
+    
+    logger.info(f"Plan for {now.strftime('%Y-%m-%d')} (SUMMER_MODE={SUMMER_MODE}):")
+    logger.info(json.dumps({k: v.strftime('%H:%M') if v else None for k, v in plan.items()}, indent=2))
+    
+    # 1. Morning sell - pojedyncze uruchomienie
+    if plan["morning_sell"] > now:
+        schedule_task(plan["morning_sell"], "EnergyMorningSell")
+        logger.info(f"Scheduled morning sell: {plan['morning_sell'].strftime('%H:%M')}")
+    
+    # 2. Midday periodic - kontrola grzalki do wieczora
+    if plan["midday_start"] > now:
+        until_hour = plan["evening_start"].hour if plan["evening_start"] else EVENING_PEAK_START_HOUR
+        schedule_task(plan["midday_start"], "EnergyMiddayPeriodic", args=f"--periodic --until {until_hour}")
+        logger.info(f"Scheduled midday periodic: {plan['midday_start'].strftime('%H:%M')} until {until_hour}:00")
+    
+    # 3. Evening periodic - sprzedaz z kontrola SOC
+    if plan["evening_start"] > now:
+        schedule_task(plan["evening_start"], "EnergyEveningPeriodic", args="--periodic --until 24")
+        logger.info(f"Scheduled evening periodic: {plan['evening_start'].strftime('%H:%M')}")
+    
+    # 4. Summer heater (jesli SUMMER_MODE wlaczony)
+    if SUMMER_MODE:
+        summer_time = now.replace(hour=6, minute=0, second=0, microsecond=0)
+        if summer_time > now:
+            logger.info("SUMMER_MODE enabled - scheduling summer_heater.py")
+            schedule_task(summer_time, "SummerHeaterPlan", script=SUMMER_HEATER)
+        else:
+            # Jesli juz po 6:00, uruchom od razu
+            logger.info("SUMMER_MODE enabled - running summer_heater.py now")
+            result = subprocess.run([PYTHON_EXE, SUMMER_HEATER], capture_output=True, text=True)
+            if result.stdout:
+                for line in result.stdout.strip().split('\n'):
+                    logger.info(f"[SummerHeater] {line}")
+            if result.stderr:
+                for line in result.stderr.strip().split('\n'):
+                    logger.warning(f"[SummerHeater] {line}")
+    
+    # 5. Scheduler na jutro (zawsze 4:00 lub wschod slonca)
+    schedule_task(plan["next_sunrise"], "EnergyDailyPlan", script=ENERGY_SCHEDULER)
+    logger.info(f"Scheduled next day: {plan['next_sunrise'].strftime('%H:%M')}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Energy Scheduler")
+    parser.add_argument("--cleanup", action="store_true", help="Remove all scheduled tasks and exit")
+    args = parser.parse_args()
+    
+    logger.info("=" * 50)
+    logger.info("######### Energy Scheduler Start ##########")
+    
+    if args.cleanup:
+        logger.info("Cleanup mode - removing all scheduled tasks")
+        cleanup_tasks()
+        logger.info("All tasks removed")
         return
-    else:
-        logger.info(
-            f"Scheduler: Plan for the day ({now_dt.strftime('%Y-%m-%d')}): {json.dumps({k: v.strftime('%H:%M') if v else None for k, v in plan.items()}, indent=2)}"
-        )
-
-    if plan["morning_sell"] and plan["morning_sell"] > now_dt:
-        schedule_manager(plan["morning_sell"], "EnergyMorningSell")
-    else:
-        logger.info(
-            f"Scheduler: No suitable morning_sell time found or it's already passed. for plan['morning_sell']: {plan['morning_sell'].strftime('%H:%M') if plan['morning_sell'] else None}"
-        )
-
-    if plan["start_charge"] and plan["start_charge"] > now_dt:
-        start_str = plan["start_charge"].strftime("%H:%M")
-        end_str = plan["stop_charge"].strftime("%H:%M") if plan["stop_charge"] else "20:00"
-        schedule_manager(plan["start_charge"], "EnergyStartCharge", f"--period {start_str} {end_str}")
-    else:
-        logger.info(
-            f"Scheduler: No suitable start_charge time found or it's already passed. for plan['start_charge']: {plan['start_charge'].strftime('%H:%M') if plan['start_charge'] else None}"
-        )
-
-    if plan["stop_charge"] and plan["stop_charge"] > now_dt:
-        schedule_manager(plan["stop_charge"], "EnergyStopCharge")
-    else:
-        logger.info(
-            f"Scheduler: No suitable stop_charge time found or it's already passed. for plan['stop_charge']: {plan['stop_charge'].strftime('%H:%M') if plan['stop_charge'] else None}"
-        )
-
-    if not plan["next_sunrise"]:
-        plan["next_sunrise"] = now_dt + timedelta(days=1, hours=5 - now_dt.hour)
-        logger.info(f"Scheduler: No next_sunrise time found for tomorrow.")
-
-    if plan["next_sunrise"] > now_dt:
-        schedule_manager(plan["next_sunrise"], "EnergyDailyPlan", script_path=ENERGY_SCHEDULER)
-    else:
-        logger.info(
-            f"Scheduler: No suitable next_sunrise time found or it's already passed. for plan['next_sunrise']: {plan['next_sunrise'].strftime('%H:%M') if plan['next_sunrise'] else None}"
-        )
-
-
-def main() -> None:
-    logger.info(f"######### Starting Energy Scheduler ##########")
+    
     try:
         plan_day()
     except Exception as e:
-        logger.error(f"Scheduler: plan_day() failed: {e}", exc_info=True)
-        try:
-            schedule_fallback()
-        except Exception as fb_e:
-            logger.error(f"Scheduler: schedule_fallback() also failed: {fb_e}", exc_info=True)
+        logger.error(f"Scheduler failed: {e}", exc_info=True)
+        # Fallback - podstawowe godziny
+        now = datetime.now(WARSAW_TZ)
+        fallbacks = [
+            (now.replace(hour=7, minute=0), "EnergyMorningSell", ""),
+            (now.replace(hour=12, minute=0), "EnergyMiddayPeriodic", "--periodic --until 17"),
+            (now.replace(hour=17, minute=0), "EnergyEveningPeriodic", "--periodic --until 24"),
+        ]
+        for time, name, args in fallbacks:
+            if time > now:
+                schedule_task(time, name, args=args)
 
 
 if __name__ == "__main__":

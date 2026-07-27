@@ -1,3 +1,9 @@
+"""
+Energy Manager - bezstanowy moduł zarządzania energią.
+
+Sam rozpoznaje co robić na podstawie: pory dnia, ceny RCE, SOC.
+Pogoda wpływa tylko na limit SOC wieczorem.
+"""
 from __future__ import annotations
 
 import argparse
@@ -7,39 +13,21 @@ import platform
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Tuple
+from dataclasses import dataclass
 
 from CONFIG import *
-from deye_client.auth import DeyeCloudAPI
-from deye_client.data_retriever import DeyeCloudDataRetriever
-from deye_client.config import CONFIG as DEYE_CONFIG
-from deye_client.check_heater import (
-    extract_values_from_latest,
-    POSSIBLE_PV_KEYS,
-    POSSIBLE_SOC_KEYS,
-    _to_float,
-)
-
-PYTHON_EXE = sys.executable
-# from energy_scheduler import PYTHON_EXE
-from meteo.open_meteo import fetch_weather_forecast, how_sunny_day
-from rce_data.fetch_rce_pln import fetch_all_from_now
-from smart_life.heater_control import (
-    SmartLifePlug,
-    load_config as load_smart_life_config,
-    DEFAULT_CONFIG_PATH as SMART_LIFE_CONFIG_PATH,
-)
-
 from zoneinfo import ZoneInfo
 
 WARSAW_TZ = ZoneInfo(TIMEZONE)
+PYTHON_EXE = sys.executable
 
-
-# Configure logging
+# === Logging ===
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "energy_automation.log")
-log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] (Manager) %(message)s")
+log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
 file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=2)
 file_handler.setFormatter(log_formatter)
@@ -49,336 +37,345 @@ stream_handler = logging.StreamHandler(sys.stdout)
 stream_handler.setFormatter(log_formatter)
 stream_handler.setLevel(logging.INFO)
 
-# Only configure root logger if no handlers are present (e.g. not imported by scheduler)
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
 
 logger = logging.getLogger(__name__)
-# If we are the main script, we might want to ensure our logger has the correct level and handlers
-# but basicConfig handles root. For named logger we can just rely on propagation.
-
-# Updated values from utility bill:
-GAS_PRICE = 0.20426  # "Gas fuel" line item
-DYSTRYBUTION_GAS = 0.05388  # "Variable distribution" line item
-VAT = 1.23  # current VAT rate
-EFITENSY_HEATING_GAS = 0.80  # keep 0.80 or adjust based on boiler specification
-# Calculation:
-PRICE_HEAT_FROM_GAS = (GAS_PRICE + DYSTRYBUTION_GAS) * VAT / EFITENSY_HEATING_GAS
-# TRESHOLD_PRICE_POWER_GAS = PRICE_HEAT_FROM_GAS * 0.99  # that is 0.39
 
 
-def get_deye_data() -> Tuple[Optional[float], Optional[float]]:
-    """Fetches SOC, PV Power and Device SN from Deye Cloud."""
+@dataclass
+class EnergyState:
+    """Aktualny stan systemu."""
+    soc: Optional[float] = None
+    pv_power: Optional[float] = None
+    rce_price: Optional[float] = None
+    cloud_cover_tomorrow: Optional[float] = None
+    current_hour: int = 0
+
+
+# === Retry decorator ===
+def with_retry(func):
+    """Decorator dodający retry do funkcji API."""
+    def wrapper(*args, **kwargs):
+        last_error = None
+        for attempt in range(API_RETRY_ATTEMPTS):
+            try:
+                result = func(*args, **kwargs)
+                if result is not None:
+                    return result
+            except Exception as e:
+                last_error = e
+                logger.warning(f"{func.__name__} attempt {attempt + 1}/{API_RETRY_ATTEMPTS} failed: {e}")
+            if attempt < API_RETRY_ATTEMPTS - 1:
+                time.sleep(API_RETRY_DELAY_SECONDS)
+        logger.error(f"{func.__name__} failed after {API_RETRY_ATTEMPTS} attempts: {last_error}")
+        return None
+    return wrapper
+
+
+# === Data fetching ===
+@with_retry
+def fetch_deye_data() -> Optional[Tuple[float, float]]:
+    """Pobiera SOC i moc PV z Deye Cloud."""
+    from deye_client.auth import DeyeCloudAPI
+    from deye_client.data_retriever import DeyeCloudDataRetriever
+    from deye_client.config import CONFIG as DEYE_CONFIG
+    from deye_client.check_heater import extract_values_from_latest, _to_float
+    
+    api = DeyeCloudAPI(region=DEYE_CONFIG.get("REGION", "eu"))
+    if not api.obtain_token(
+        app_id=DEYE_CONFIG.get("APP_ID", ""),
+        app_secret=DEYE_CONFIG.get("APP_SECRET", ""),
+        email=DEYE_CONFIG.get("EMAIL", ""),
+        password=DEYE_CONFIG.get("PASSWORD", ""),
+    ):
+        raise Exception("Deye authentication failed")
+    
+    retriever = DeyeCloudDataRetriever(api)
+    stations_resp = retriever.get_station_list()
+    stations = (stations_resp or {}).get("stationList") or (stations_resp or {}).get("data") or []
+    if not stations:
+        raise Exception("No stations found")
+    
+    station = stations[0]
+    device_sn = str(station.get("deviceSn") or station.get("sn") or "")
+    soc = _to_float(station.get("batterySOC"))
+    pv_power = _to_float(station.get("generationPower"))
+    
+    if device_sn:
+        latest = retriever.get_device_latest_data(device_sn)
+        if latest:
+            dev_soc, dev_pv = extract_values_from_latest(latest)
+            soc = dev_soc if dev_soc is not None else soc
+            pv_power = dev_pv if dev_pv is not None else pv_power
+    
+    if soc is None:
+        raise Exception("Could not get SOC")
+    
+    logger.info(f"Deye: SOC={soc}%, PV={pv_power}W")
+    return soc, pv_power or 0
+
+
+@with_retry
+def fetch_rce_price() -> Optional[float]:
+    """Pobiera aktualna cene RCE w PLN/kWh. Fallback: SELL_THRESHOLD (bezpieczna wartosc)."""
+    from rce_data.fetch_rce_pln import fetch_all_from_now
+    items, _ = fetch_all_from_now()
+    if not items:
+        raise Exception("No RCE data")
+    price_kwh = float(items[0].get("rce_pln") or items[0].get("rce") or 0) / 1000.0
+    logger.info(f"RCE: {price_kwh:.4f} PLN/kWh")
+    return price_kwh
+
+
+@with_retry  
+def fetch_cloud_cover_tomorrow() -> Optional[float]:
+    """Pobiera średnie zachmurzenie jutro (7-18)."""
+    from meteo.open_meteo import how_sunny_tomorrow
+    return how_sunny_tomorrow(LAT, LON, TIMEZONE)
+
+
+def get_state() -> EnergyState:
+    """Pobiera pelny stan systemu. Uzywa fallbackow gdy API nie dziala."""
+    state = EnergyState()
+    state.current_hour = datetime.now(WARSAW_TZ).hour
+    
+    deye = fetch_deye_data()
+    if deye:
+        state.soc, state.pv_power = deye
+    
+    state.rce_price = fetch_rce_price()
+    # Fallback dla ceny: uzyj progu (nie sprzedawaj, nie kupuj)
+    if state.rce_price is None:
+        state.rce_price = SELL_THRESHOLD
+        logger.warning(f"RCE API failed - using threshold {SELL_THRESHOLD} as fallback")
+    
+    # Pogoda jutro tylko wieczorem (potrzebna do limitu SOC)
+    if state.current_hour >= EVENING_PEAK_START_HOUR:
+        state.cloud_cover_tomorrow = fetch_cloud_cover_tomorrow()
+        # Fallback: 50% zachmurzenia = domyslny limit SOC
+    
+    return state
+
+
+# === Decision helpers ===
+def get_evening_soc_limit(cloud_cover_tomorrow: Optional[float]) -> int:
+    """Limit SOC wieczorem zależny od pogody jutro."""
+    if cloud_cover_tomorrow is None:
+        return EVENING_SELL_SOC_DEFAULT
+    if cloud_cover_tomorrow < VERY_SUNNY_CLOUD_THRESHOLD:
+        return EVENING_SELL_SOC_SUNNY
+    if cloud_cover_tomorrow > SUNNY_CLOUD_THRESHOLD:
+        return EVENING_SELL_SOC_CLOUDY
+    return EVENING_SELL_SOC_DEFAULT
+
+
+def is_evening() -> bool:
+    """Czy jest wieczór (17-24)."""
+    hour = datetime.now(WARSAW_TZ).hour
+    return EVENING_PEAK_START_HOUR <= hour < EVENING_PEAK_END_HOUR
+
+
+def is_low_price(price: Optional[float]) -> bool:
+    """Czy cena jest poniżej progu opłacalności."""
+    return price is not None and price < SELL_THRESHOLD
+
+
+# === Inverter control ===
+@with_retry
+def set_inverter_mode(selling: bool) -> bool:
+    """Ustawia tryb falownika."""
+    from deye_client.auth import DeyeCloudAPI
+    from deye_client.data_retriever import DeyeCloudDataRetriever
+    from deye_client.config import CONFIG as DEYE_CONFIG
+    
+    api = DeyeCloudAPI(region=DEYE_CONFIG.get("REGION", "eu"))
+    if not api.obtain_token(
+        app_id=DEYE_CONFIG.get("APP_ID", ""),
+        app_secret=DEYE_CONFIG.get("APP_SECRET", ""),
+        email=DEYE_CONFIG.get("EMAIL", ""),
+        password=DEYE_CONFIG.get("PASSWORD", ""),
+    ):
+        raise Exception("Deye auth failed")
+    
+    retriever = DeyeCloudDataRetriever(api)
+    mode = "SELLING_FIRST" if selling else "ZERO_EXPORT_TO_CT"
+    resp = retriever.set_system_work_mode(mode)
+    
+    if resp and resp.get("success"):
+        logger.info(f"Falownik: {mode}")
+        return True
+    raise Exception(f"set_work_mode failed: {resp}")
+
+
+# === Heater control ===
+def control_heater(state: EnergyState) -> None:
+    """
+    Control heater.
+    Turn on when SOC >= 98% AND PV > 500W AND price < threshold
+    """
+    from smart_life.heater_control import SmartLifePlug, load_config, DEFAULT_CONFIG_PATH
+    
     try:
-        api: DeyeCloudAPI = DeyeCloudAPI(region=DEYE_CONFIG.get("REGION", "eu"))
-        ok: bool = api.obtain_token(
-            app_id=DEYE_CONFIG.get("APP_ID", ""),
-            app_secret=DEYE_CONFIG.get("APP_SECRET", ""),
-            email=DEYE_CONFIG.get("EMAIL", ""),
-            password=DEYE_CONFIG.get("PASSWORD", ""),
-        )
-        if not ok:
-            logger.error("Deye authentication failed")
-            return 0, 0
-
-        retriever: DeyeCloudDataRetriever = DeyeCloudDataRetriever(api)
-
-        device_sn: Optional[str] = None
-        soc_fallback: Optional[float] = None
-        pv_fallback: Optional[float] = None
-
-        # 2. Fallback to station list
-        stations_response: Optional[Dict[str, Any]] = retriever.get_station_list()
-        stations: List[Any] = []
-        if stations_response:
-            stations = stations_response.get("stationList") or stations_response.get("data") or []
-
-        if not stations:
-            logger.error(f"No stations found either. Response: {stations_response}")
-            return 0, 0
-
-        first_station: Dict[str, Any] = stations[0]
-        station_id: Any = first_station.get("id")
-
-        # Check if station list entry has SN
-        device_sn = str(first_station.get("deviceSn") or first_station.get("sn") or "")
-
-        # Extract values directly from station record as fallback
-        soc_fallback = _to_float(first_station.get("batterySOC"))
-        pv_fallback = _to_float(first_station.get("generationPower"))
-
-        # 3. Get station latest data
-        station_data_response: Optional[Dict[str, Any]] = retriever.get_station_latest_data(station_id)
-        if not station_data_response:
-            logger.error(f"Failed to get data for station {station_id}")
-            # If we already have device_sn from station list, we can still continue to step 5
-            if not device_sn:
-                return soc_fallback, pv_fallback
-        else:
-            station_data: Dict[str, Any] = station_data_response.get("data") or {}
-
-            # 4. Check if station data contains a device SN
-            if not device_sn:
-                device_sn = str(station_data.get("deviceSn") or station_data.get("sn") or "")
-
-            # If station record doesn't include device SN, try station/device endpoint
-            if not device_sn:
-                station_devices_resp = retriever.get_station_devices([station_id])
-                devices_list = []
-                if station_devices_resp:
-                    devices_list = (
-                        station_devices_resp.get("deviceList")
-                        or station_devices_resp.get("data")
-                        or station_devices_resp.get("deviceListItems")
-                        or []
-                    )
-                if isinstance(devices_list, list) and devices_list:
-                    first_dev = devices_list[0]
-                    device_sn = str(first_dev.get("deviceSn") or first_dev.get("sn") or "")
-
-            if not device_sn:
-                # Try to extract SOC/PV directly from station data as fallback
-                logger.info("No device SN in station data, attempting to extract values directly.")
-                soc: Optional[float] = None
-                pv_power: Optional[float] = None
-
-                for key in POSSIBLE_SOC_KEYS:
-                    if key in station_data:
-                        soc = _to_float(station_data[key])
-                        if soc is not None:
-                            break
-
-                for key in POSSIBLE_PV_KEYS:
-                    if key in station_data:
-                        pv_power = _to_float(station_data[key])
-                        if pv_power is not None:
-                            break
-
-                # Use fallbacks if station_data didn't have them
-                soc = soc if soc is not None else soc_fallback
-                pv_power = pv_power if pv_power is not None else pv_fallback
-
-                if soc is not None or pv_power is not None:
-                    logger.info(f"Extracted from station: SOC={soc}%, PV={pv_power}W")
-                    return soc, pv_power
-
-                logger.error(f"Could not find device SN or data in station. Keys: {list(station_data.keys())}")
-                return 0, 0
-
-        # 5. Get latest data for the found device SN
-        latest_response: Optional[Dict[str, Any]] = retriever.get_device_latest_data(device_sn)
-        soc, pv_power = extract_values_from_latest(latest_response)
-
-        # Use fallbacks if latest data is missing
-        if soc is None and soc_fallback is not None:
-            soc = soc_fallback
-        if pv_power is None and pv_fallback is not None:
-            pv_power = pv_fallback
-
-        if soc is None or pv_power is None:
-            logger.warning(f"Could not extract SOC/PV from device {device_sn} latest data. Response: {latest_response}")
-            # Final attempt: maybe station data has it and we haven't checked yet (if we came from device list)
-            # But if we have a device SN, the device latest data should be the source of truth.
-
-        logger.info(f"Deye Data - Device: {device_sn}, SOC: {soc}%, PV Power: {pv_power}W")
-        return soc, pv_power
-
-    except Exception as e:
-        logger.error(f"Error in get_deye_data: {e}")
-        return 0, 0
-
-
-def get_current_rce_price() -> Optional[float]:
-    """Fetches the current RCE price (PLN)."""
-    try:
-        items, _ = fetch_all_from_now()
-        if not items:
-            logger.warning("No RCE price data available for the current time")
-            return 0
-
-        # The first item should be the current/closest future price
-        # fetch_all_from_now filters for dtime >= now
-        current_item = items[0]
-        current_price_str: Any = current_item.get("rce_pln") or current_item.get("rce")
-        if current_price_str is None:
-            logger.warning(f"RCE field missing in data. Keys: {list(current_item.keys())}")
-            return 0
-
-        price_mwh: float = float(current_price_str)
-        price_kwh: float = price_mwh / 1000.0
-        logger.info(f"Current RCE Price: {price_mwh:.2f} PLN/MWh ({price_kwh:.4f} PLN/kWh)")
-        return price_kwh
-    except Exception as e:
-        logger.error(f"Error fetching RCE price: {e}")
-        return 0
-
-
-def manage_energy() -> Optional[float]:
-    """Main entry for legacy/standalone energy management."""
-    soc, pv_power = get_deye_data()
-
-    rce_price_kwh = get_current_rce_price()
-    treshold_price = calculate_threshold_based_on_weather()
-
-    manage_sell_power(rce_price_kwh, treshold_price)
-    manage_heater_on_off(soc, pv_power, rce_price_kwh, treshold_price)
-    return soc
-
-
-def calculate_threshold_based_on_weather() -> float:
-    weather_data = fetch_weather_forecast(LAT, LON, TIMEZONE)
-    cloud_cover = how_sunny_day(weather_data)
-    treshold_price = TRESHOLD_PRICE_POWER_GAS
-    if cloud_cover < VERY_SUNNY_CLOUD_THRESHOLD:
-        treshold_price = TRESHOLD_PRICE_POWER_GAS - UNDER_TRHESHOLD_FOR_LONGER_SELL
-    elif cloud_cover > SUNNY_CLOUD_THRESHOLD:
-        treshold_price = PRICE_POWER_I_BUY
-    logger.info(
-        f"Calculated threshold price based on weather: {treshold_price:.4f} PLN/kWh (Cloud cover: {cloud_cover:.1f}%)"
-    )
-    return treshold_price
-
-
-def manage_sell_power(rce_price_kwh, treshold_price):
-    try:
-        api: DeyeCloudAPI = DeyeCloudAPI(region=DEYE_CONFIG.get("REGION", "eu"))
-        api.obtain_token(
-            app_id=DEYE_CONFIG.get("APP_ID", ""),
-            app_secret=DEYE_CONFIG.get("APP_SECRET", ""),
-            email=DEYE_CONFIG.get("EMAIL", ""),
-            password=DEYE_CONFIG.get("PASSWORD", ""),
-        )
-        retriever = DeyeCloudDataRetriever(api)
-
-        if datetime.now().hour < 12 and rce_price_kwh > treshold_price:
-            logger.info(f"Price {rce_price_kwh:.4f} > Threshold {treshold_price:.4f}. Setting Deye to 'SELLING_FIRST'.")
-            resp = retriever.set_system_work_mode("SELLING_FIRST")
-            if not resp or resp.get("success") is not True:
-                logger.warning(
-                    "set_system_work_mode did not report success; not attempting /order/battery/modeControl as it's for battery charge-mode actions."
-                )
-        else:
-            logger.info(
-                f"Price {rce_price_kwh:.4f} <= Threshold {treshold_price:.4f}. or Not a sunny day. Setting Deye to 'ZERO_EXPORT_TO_CT'."
-            )
-            resp = retriever.set_system_work_mode("ZERO_EXPORT_TO_CT")
-            if not resp or resp.get("success") is not True:
-                logger.warning(
-                    "set_system_work_mode did not report success; not attempting /order/battery/modeControl as it's for battery charge-mode actions."
-                )
-    except Exception as e:
-        logger.error(f"Error managing sell power: {e}")
-
-
-def manage_heater_on_off(soc, pv_power, rce_price_kwh, treshold_price):
-    try:
-        smart_life_config = load_smart_life_config(SMART_LIFE_CONFIG_PATH)
-        plug = SmartLifePlug(smart_life_config)
-        is_heater_on: bool = plug.is_on()
-        logger.info(f"Current heater state: {'ON' if is_heater_on else 'OFF'}")
-
-        if not is_heater_on:
-            if (pv_power > TRESHOLD_PV_POWER) and (soc >= TRESHOLD_SOC_ON) and (rce_price_kwh < treshold_price):
-                logger.info("Conditions MET. Turning ON the heater.")
+        config = load_config(DEFAULT_CONFIG_PATH)
+        plug = SmartLifePlug(config)
+        is_on = plug.is_on()
+        
+        soc = state.soc or 0
+        pv = state.pv_power or 0
+        price = state.rce_price or 999
+        
+        logger.info(f"Heater: {'ON' if is_on else 'OFF'}, SOC={soc}%, PV={pv}W, price={price:.4f}")
+        
+        if not is_on:
+            soc_ok = soc >= TRESHOLD_SOC_ON
+            price_ok = price < SELL_THRESHOLD
+            pv_ok = pv > TRESHOLD_PV_POWER
+            
+            if soc_ok and price_ok and pv_ok:
+                logger.info("Turning heater ON")
                 plug.turn_on()
             else:
-                logger.info("Conditions NOT MET for turning ON. Staying OFF.")
+                logger.info(f"Conditions not met: SOC>={TRESHOLD_SOC_ON}?{soc_ok}, price<{SELL_THRESHOLD}?{price_ok}, PV>{TRESHOLD_PV_POWER}?{pv_ok}")
         else:
-            if (soc <= TRESHOLD_SOC_OFF) or (pv_power < TRESHOLD_PV_POWER):
-                logger.info(f"Conditions MET for turning OFF: SOC={soc}% or PV={pv_power}W. Turning OFF.")
+            soc_low = soc <= TRESHOLD_SOC_OFF
+            pv_low = pv < TRESHOLD_PV_POWER
+            
+            if soc_low or pv_low:
+                logger.info(f"Turning heater OFF: SOC<={TRESHOLD_SOC_OFF}?{soc_low}, PV<{TRESHOLD_PV_POWER}?{pv_low}")
                 plug.turn_off()
             else:
-                logger.info("Conditions NOT MET for turning OFF. Staying ON.")
-
+                logger.info("Heater stays ON")
+                
     except Exception as e:
-        logger.error(f"Error controlling Smart Life device: {e}")
+        logger.error(f"Heater error: {e}")
 
 
-def manage_energy_periodic() -> Optional[int]:
-    """Entry point for periodic energy management (e.g. called by scheduler)."""
-    soc = manage_energy()
-    if soc is not None:
-        if soc < TRESHOLD_SOC_OFF:
-            minutes_to_run_again = abs((TRESHOLD_SOC_ON - soc) * 2)
+# === Main logic ===
+def manage_energy() -> Optional[float]:
+    """
+    Main function - auto-detects what to do:
+    
+    EVENING (17-24):
+        Sell if: price >= threshold AND SOC > limit (depends on tomorrow weather)
+    
+    DAY:
+        Price < threshold: don't sell, control heater
+        Price >= threshold: sell
+    
+    Returns SOC or None on error.
+    If Deye API fails - no action taken (safety).
+    """
+    logger.info("=" * 50)
+    state = get_state()
+    
+    # Deye API is critical - without SOC we can't make decisions
+    if state.soc is None:
+        logger.error("Deye API failed - no action taken (safety)")
+        return None
+    
+    logger.info(f"Hour: {state.current_hour}, SOC: {state.soc}%, Price: {state.rce_price:.4f}, Threshold: {SELL_THRESHOLD}")
+    
+    # === EVENING ===
+    if is_evening():
+        soc_limit = get_evening_soc_limit(state.cloud_cover_tomorrow)
+        logger.info(f"EVENING - SOC limit: {soc_limit}% (tomorrow cloud: {state.cloud_cover_tomorrow}%)")
+        
+        if state.soc > soc_limit and state.rce_price >= SELL_THRESHOLD:
+            logger.info(f"Selling: SOC {state.soc}% > {soc_limit}%, price {state.rce_price:.4f} >= {SELL_THRESHOLD}")
+            set_inverter_mode(selling=True)
         else:
-            minutes_to_run_again = abs(soc - TRESHOLD_SOC_OFF)
-            minutes_to_run_again_2 = abs(soc - TRESHOLD_SOC_OFF)
-            minutes_to_run_again = min(minutes_to_run_again, minutes_to_run_again_2)
-            minutes_to_run_again = max(minutes_to_run_again, 2)
-        return int(minutes_to_run_again)
-    return None
-
-
-def run_cmd(command: str) -> bool:
-    logger.info(f"Running command: {command}")
-    try:
-        subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Command failed: {command}. Error: {e.stderr}")
-        return False
-
-
-def schedule_self(time: datetime, task_name: str, start_time: str, end_time: str) -> bool:
-    script_path = os.path.abspath(__file__)
-    st = time.strftime("%H:%M")
-    sd = time.strftime("%d/%m/%Y")
-
-    if platform.system() == "Windows":
-        tr = f'"{PYTHON_EXE}" "{script_path}" --period {start_time} {end_time}'
-        cmd = f'schtasks /create /sc once /tn "{task_name}" /tr "{tr}" /st {st} /sd {sd} /f'
+            reason = f"SOC {state.soc}% <= {soc_limit}%" if state.soc <= soc_limit else f"price {state.rce_price:.4f} < {SELL_THRESHOLD}"
+            logger.info(f"Stop selling: {reason}")
+            set_inverter_mode(selling=False)
+        
+        return state.soc
+    
+    # === DAY ===
+    if is_low_price(state.rce_price):
+        logger.info(f"DAY - low price ({state.rce_price:.4f} < {SELL_THRESHOLD}), heater control")
+        set_inverter_mode(selling=False)
+        control_heater(state)
     else:
-        # On Linux, use shlex.quote to handle potential spaces in paths
-        # tr is the command to be executed by at
-        tr = f"{shlex.quote(PYTHON_EXE)} {shlex.quote(script_path)} --period {shlex.quote(start_time)} {shlex.quote(end_time)}"
-        # We use a single quote for echo to prevent shell expansion of tr content,
-        # and shlex.quote to safely wrap it.
-        cmd = f"echo {shlex.quote(tr)} | at {time.strftime('%H:%M %Y-%m-%d')}"
-    return run_cmd(cmd)
+        logger.info(f"DAY - high price ({state.rce_price:.4f} >= {SELL_THRESHOLD}), selling")
+        set_inverter_mode(selling=True)
+    
+    return state.soc
 
 
-def manage_periodic(start: bool, start_time: str, end_time: str) -> bool:
-    task_name = "EnergyPeriodicHeater"
-    if start:
-        minutes = manage_energy_periodic()
-        if minutes is not None:
-            next_time = datetime.now(WARSAW_TZ) + timedelta(minutes=minutes)
-            schedule_self(next_time, task_name, start_time, end_time)
-    return True
+def calculate_next_check_minutes(state: EnergyState) -> int:
+    """Oblicza czas do następnego sprawdzenia."""
+    if state.soc is None:
+        return MIN_CHECK_INTERVAL_MINUTES
+    
+    if is_evening():
+        soc_limit = get_evening_soc_limit(state.cloud_cover_tomorrow)
+        minutes = abs(state.soc - soc_limit) * MINUTES_PER_SOC_PERCENT
+    else:
+        minutes = abs(state.soc - TRESHOLD_SOC_OFF) * MINUTES_PER_SOC_PERCENT
+    
+    return max(int(minutes), MIN_CHECK_INTERVAL_MINUTES)
 
 
+def should_continue_periodic(state: EnergyState) -> bool:
+    """Czy kontynuować tryb periodic."""
+    if state.soc is None:
+        return False
+    
+    if is_evening():
+        soc_limit = get_evening_soc_limit(state.cloud_cover_tomorrow)
+        return state.soc > soc_limit
+    else:
+        return is_low_price(state.rce_price)
+
+
+# === Self-scheduling ===
+def schedule_next_run(minutes: int, end_hour: int) -> None:
+    """Schedule next run."""
+    script = os.path.abspath(__file__)
+    next_time = datetime.now(WARSAW_TZ) + timedelta(minutes=minutes)
+    
+    if next_time.hour >= end_hour:
+        logger.info(f"End of window ({end_hour}:00) - disabling selling")
+        set_inverter_mode(selling=False)
+        return
+    
+    args = f"--periodic --until {end_hour}"
+    task = "EnergyPeriodicCheck"
+    
+    if platform.system() == "Windows":
+        tr = f'"{PYTHON_EXE}" "{script}" {args}'
+        cmd = f'schtasks /create /sc once /tn "{task}" /tr "{tr}" /st {next_time.strftime("%H:%M")} /sd {next_time.strftime("%d/%m/%Y")} /f'
+    else:
+        tr = f"{shlex.quote(PYTHON_EXE)} {shlex.quote(script)} {args}"
+        cmd = f"echo {shlex.quote(tr)} | at {next_time.strftime('%H:%M %Y-%m-%d')}"
+    
+    logger.info(f"Next check in {minutes} min ({next_time.strftime('%H:%M')})")
+    subprocess.run(cmd, shell=True, capture_output=True)
+
+
+# === CLI ===
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Energy Manager")
-    parser.add_argument(
-        "--period",
-        nargs=2,
-        metavar=("START", "END"),
-        help="Run in periodic mode between START and END times (HH:MM) and schedule next run",
-    )
+    parser.add_argument("--periodic", action="store_true", help="Tryb cykliczny")
+    parser.add_argument("--until", type=int, default=24, help="Godzina zakończenia cyklu")
+    parser.add_argument("--dry-run", action="store_true", help="Tylko pokaż stan")
     args = parser.parse_args()
-    logger.info(f"######### Starting Energy Manager ##########")
-    if args.period:
-        start_time_str, end_time_str = args.period
-        try:
-            start_time = datetime.strptime(start_time_str, "%H:%M").time()
-            end_time = datetime.strptime(end_time_str, "%H:%M").time()
-        except ValueError as e:
-            logger.error(f"Invalid time format in --period: {e}")
-            sys.exit(1)
-
-        now = datetime.now(WARSAW_TZ)
-        current_time = now.time()
-
-        if start_time <= current_time <= end_time:
-            logger.info(f"Periodic mode active (within {start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}).")
-            minutes = manage_energy_periodic()
-            if minutes is not None:
-                next_time = now + timedelta(minutes=minutes)
-                logger.info(f"Scheduling next run in {minutes} minutes (at {next_time.strftime('%H:%M')}).")
-                schedule_self(next_time, "EnergyPeriodicHeater", start_time_str, end_time_str)
+    
+    logger.info("######### Energy Manager Start ##########")
+    
+    if args.dry_run:
+        state = get_state()
+        logger.info(f"SOC={state.soc}%, cena={state.rce_price}, wieczór={is_evening()}, SUMMER_MODE={SUMMER_MODE}")
+        sys.exit(0)
+    
+    soc = manage_energy()
+    
+    if args.periodic and soc is not None:
+        state = get_state()
+        if should_continue_periodic(state):
+            minutes = calculate_next_check_minutes(state)
+            schedule_next_run(minutes, args.until)
         else:
-            logger.info(
-                f"Current time {current_time.strftime('%H:%M')} is outside window {start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}. Stopping."
-            )
-    else:
-        manage_energy()
+            logger.info("Periodic conditions not met - ending")
+            set_inverter_mode(selling=False)
