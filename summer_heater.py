@@ -13,7 +13,6 @@ Uzycie:
 from __future__ import annotations
 
 import argparse
-import fcntl
 import logging
 import os
 import platform
@@ -81,23 +80,25 @@ def heater_off() -> bool:
 
 def find_daily_minimum() -> Optional[datetime]:
     """
-    Find the hour with lowest price during day (8:00-16:00).
-    Returns datetime of the minimum price hour.
-    Fallback: 12:00 (typical minimum time)
+    Find the cheapest 2-hour window during day (8:00-16:00).
+    Uses sum of consecutive 2 hours to find optimal heating window.
+    Returns datetime of the start of the cheapest window.
+    Fallback: 11:00 (heating 11:00-13:00)
     """
     from rce_data.fetch_rce_pln import fetch_all_from_now, parse_rce_datetime
+    from price_utils import find_cheapest_window
     
     now = datetime.now(WARSAW_TZ)
     today = now.date()
-    fallback = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    fallback = now.replace(hour=11, minute=0, second=0, microsecond=0)
     
     try:
         items, _ = fetch_all_from_now()
         if not items:
-            logger.warning("No RCE data - using fallback 12:00")
+            logger.warning("No RCE data - using fallback 11:00")
             return fallback
         
-        # Find minimum in 8:00-16:00 range
+        # Collect prices in 8:00-16:00 range, sorted by time
         day_prices = []
         for item in items:
             dt = parse_rce_datetime(item["dtime"])
@@ -105,16 +106,28 @@ def find_daily_minimum() -> Optional[datetime]:
                 price = float(item.get("rce_pln") or item.get("rce") or 0) / 1000.0
                 day_prices.append((dt, price))
         
+        day_prices.sort(key=lambda x: x[0])
+        
         if not day_prices:
-            logger.warning("No prices found for today 8:00-16:00 - using fallback 12:00")
+            logger.warning("No prices found for today 8:00-16:00 - using fallback 11:00")
             return fallback
         
-        min_time, min_price = min(day_prices, key=lambda x: x[1])
-        logger.info(f"Daily minimum: {min_time.strftime('%H:%M')} @ {min_price:.4f} PLN/kWh")
-        return min_time
+        if len(day_prices) < 2:
+            min_time, min_price = day_prices[0]
+            logger.info(f"Daily minimum (single): {min_time.strftime('%H:%M')} @ {min_price:.4f} PLN/kWh")
+            return min_time
+        
+        # Find cheapest 2h window
+        result = find_cheapest_window(day_prices)
+        if result:
+            best_start, best_sum = result
+            logger.info(f"Cheapest 2h window: {best_start.strftime('%H:%M')}-{(best_start + timedelta(hours=2)).strftime('%H:%M')} (avg={best_sum/2:.4f} PLN/kWh)")
+            return best_start
+        
+        return fallback
         
     except Exception as e:
-        logger.error(f"Failed to find daily minimum: {e} - using fallback 12:00")
+        logger.error(f"Failed to find daily minimum: {e} - using fallback 11:00")
         return fallback
 
 
@@ -145,28 +158,28 @@ def cleanup_tasks() -> None:
 def plan_summer_heating() -> None:
     """
     Plan summer heating for today:
-    - Turn ON 1 hour before daily price minimum
-    - Turn OFF 1 hour after daily price minimum
-    Always schedules (uses fallback 12:00 if API fails)
+    - Turn ON at start of cheapest 2h window
+    - Turn OFF at end of cheapest 2h window (start + 2h)
+    Always schedules (uses fallback 11:00 if API fails)
     """
     logger.info("=" * 50)
     logger.info("Planning summer heating")
     
     cleanup_tasks()
     
-    min_time = find_daily_minimum()  # Always returns a time (fallback 12:00)
+    window_start = find_daily_minimum()  # Always returns a time (fallback 11:00)
     now = datetime.now(WARSAW_TZ)
     
-    # ON: 1 hour before minimum
-    on_time = min_time - timedelta(hours=1)
+    # ON: at window start
+    on_time = window_start
     if on_time > now:
         schedule_task(on_time, "SummerHeaterOn", "on")
         logger.info(f"Scheduled heater ON at {on_time.strftime('%H:%M')}")
     else:
         logger.info(f"ON time {on_time.strftime('%H:%M')} already passed")
     
-    # OFF: 1 hour after minimum
-    off_time = min_time + timedelta(hours=1)
+    # OFF: at window end (start + 2h)
+    off_time = window_start + timedelta(hours=2)
     if off_time > now:
         schedule_task(off_time, "SummerHeaterOff", "off")
         logger.info(f"Scheduled heater OFF at {off_time.strftime('%H:%M')}")
@@ -181,13 +194,11 @@ def main():
     args = parser.parse_args()
     
     # Lock file - zapobiega równoległym uruchomieniom
+    from file_lock import FileLock
     lock_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".summer_heater.lock")
-    lock_fp = open(lock_file_path, "w")
-    try:
-        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (IOError, OSError):
+    lock = FileLock(lock_file_path)
+    if not lock.acquire():
         logger.warning("Another summer_heater instance is running - exiting")
-        lock_fp.close()
         return
     
     try:
@@ -200,12 +211,7 @@ def main():
         else:
             plan_summer_heating()
     finally:
-        fcntl.flock(lock_fp, fcntl.LOCK_UN)
-        lock_fp.close()
-        try:
-            os.unlink(lock_file_path)
-        except OSError:
-            pass
+        lock.release()
 
 
 if __name__ == "__main__":

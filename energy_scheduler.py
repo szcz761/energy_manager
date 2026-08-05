@@ -10,7 +10,6 @@ Planuje 3 zadania:
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import logging
 import os
@@ -129,9 +128,11 @@ def get_sell_threshold() -> float:
 def calculate_plan() -> dict[str, Optional[datetime]]:
     """
     Oblicza plan dnia na podstawie cen RCE.
+    Uzywa okienek 2h (sumaryczna cena) zamiast pojedynczych godzin.
     Jesli API nie dziala, uzywa domyslnych godzin.
     """
     from rce_data.fetch_rce_pln import parse_rce_datetime
+    from price_utils import find_cheapest_window, find_most_expensive_window, filter_prices_by_hour_range
     
     now = datetime.now(WARSAW_TZ)
     tomorrow = now + timedelta(days=1)
@@ -156,32 +157,53 @@ def calculate_plan() -> dict[str, Optional[datetime]]:
             logger.warning("No RCE prices - using default times")
             return plan
         
-        # Poranny pik (6-12)
-        morning = [(parse_rce_datetime(p["dtime"]), float(p.get("rce_pln") or p.get("rce") or 0) / 1000)
-                   for p in prices if 6 <= parse_rce_datetime(p["dtime"]).hour < 12 
-                   and parse_rce_datetime(p["dtime"]).date() == now.date()]
-        if morning:
-            peak_time, _ = max(morning, key=lambda x: x[1])
-            plan["morning_sell"] = peak_time - timedelta(hours=1)
-            logger.info(f"Morning peak: {peak_time.strftime('%H:%M')}")
-        
-        # Midday - pierwsza godzina gdy cena < prog (po 10:00)
+        # Parse cen na dzis
+        today_prices = []
         for p in prices:
             dt = parse_rce_datetime(p["dtime"])
-            price = float(p.get("rce_pln") or p.get("rce") or 0) / 1000
-            if dt.date() == now.date() and dt.hour >= 10 and price < threshold:
-                plan["midday_start"] = dt
-                logger.info(f"Midday start (price < {threshold}): {dt.strftime('%H:%M')} @ {price:.4f}")
-                break
+            if dt.date() == now.date():
+                price = float(p.get("rce_pln") or p.get("rce") or 0) / 1000
+                today_prices.append((dt, price))
         
-        # Wieczorny pik (17-24)
-        evening = [(parse_rce_datetime(p["dtime"]), float(p.get("rce_pln") or p.get("rce") or 0) / 1000)
-                   for p in prices if EVENING_PEAK_START_HOUR <= parse_rce_datetime(p["dtime"]).hour < EVENING_PEAK_END_HOUR
-                   and parse_rce_datetime(p["dtime"]).date() == now.date()]
-        if evening:
-            peak_time, _ = max(evening, key=lambda x: x[1])
-            plan["evening_start"] = peak_time - timedelta(hours=1)
-            logger.info(f"Evening peak: {peak_time.strftime('%H:%M')}")
+        today_prices.sort(key=lambda x: x[0])
+        
+        if not today_prices:
+            logger.warning("No prices for today - using defaults")
+            return plan
+        
+        # --- Morning sell: najdrozsze 2h okno w zakresie 6-12 ---
+        morning = filter_prices_by_hour_range(today_prices, 6, 12)
+        result = find_most_expensive_window(morning)
+        if result:
+            best_start, best_sum = result
+            plan["morning_sell"] = best_start
+            logger.info(f"Morning sell window: {best_start.strftime('%H:%M')}-{(best_start + timedelta(hours=2)).strftime('%H:%M')} (sum={best_sum:.4f})")
+        elif morning:
+            plan["morning_sell"] = morning[0][0]
+            logger.info(f"Morning sell (single hour): {morning[0][0].strftime('%H:%M')}")
+        
+        # --- Midday start: najtansze 2h okno w zakresie 10-17 (start grzalki) ---
+        midday = filter_prices_by_hour_range(today_prices, 10, 17)
+        result = find_cheapest_window(midday)
+        if result:
+            best_start, best_sum = result
+            # Tylko jesli srednia cena okienka < threshold
+            if best_sum / 2 < threshold:
+                plan["midday_start"] = best_start
+                logger.info(f"Midday cheapest window: {best_start.strftime('%H:%M')}-{(best_start + timedelta(hours=2)).strftime('%H:%M')} (avg={best_sum/2:.4f})")
+            else:
+                logger.info(f"No cheap midday window (best avg={best_sum/2:.4f} >= {threshold})")
+        
+        # --- Evening sell: najdrozsze 2h okno w zakresie 17-24 ---
+        evening = filter_prices_by_hour_range(today_prices, EVENING_PEAK_START_HOUR, EVENING_PEAK_END_HOUR)
+        result = find_most_expensive_window(evening)
+        if result:
+            best_start, best_sum = result
+            plan["evening_start"] = best_start
+            logger.info(f"Evening sell window: {best_start.strftime('%H:%M')}-{(best_start + timedelta(hours=2)).strftime('%H:%M')} (sum={best_sum:.4f})")
+        elif evening:
+            plan["evening_start"] = evening[0][0]
+            logger.info(f"Evening sell (single hour): {evening[0][0].strftime('%H:%M')}")
             
     except Exception as e:
         logger.error(f"Plan calculation failed: {e} - using defaults")
@@ -243,13 +265,11 @@ def main():
     args = parser.parse_args()
     
     # Lock file - zapobiega równoległym uruchomieniom
+    from file_lock import FileLock
     lock_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".scheduler.lock")
-    lock_fp = open(lock_file_path, "w")
-    try:
-        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (IOError, OSError):
+    lock = FileLock(lock_file_path)
+    if not lock.acquire():
         # Inny proces schedulera już działa - wychodzimy cicho
-        lock_fp.close()
         sys.exit(0)
     
     try:
@@ -277,12 +297,7 @@ def main():
                 if time > now:
                     schedule_task(time, name, args=fall_args)
     finally:
-        fcntl.flock(lock_fp, fcntl.LOCK_UN)
-        lock_fp.close()
-        try:
-            os.unlink(lock_file_path)
-        except OSError:
-            pass
+        lock.release()
 
 
 if __name__ == "__main__":

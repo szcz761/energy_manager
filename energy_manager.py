@@ -7,7 +7,6 @@ Pogoda wpływa tylko na limit SOC wieczorem.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import logging
 import os
 import platform
@@ -364,13 +363,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # Lock file - zapobiega równoległym uruchomieniom
+    from file_lock import FileLock
     lock_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".energy_manager.lock")
-    lock_fp = open(lock_file_path, "w")
-    try:
-        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (IOError, OSError):
+    lock = FileLock(lock_file_path)
+    if not lock.acquire():
         logger.warning("Another energy_manager instance is running - exiting")
-        lock_fp.close()
         sys.exit(0)
     
     try:
@@ -392,9 +389,4 @@ if __name__ == "__main__":
                 logger.info("Periodic conditions not met - ending")
                 set_inverter_mode(selling=False)
     finally:
-        fcntl.flock(lock_fp, fcntl.LOCK_UN)
-        lock_fp.close()
-        try:
-            os.unlink(lock_file_path)
-        except OSError:
-            pass
+        lock.release()
