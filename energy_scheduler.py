@@ -10,6 +10,7 @@ Planuje 3 zadania:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
@@ -69,11 +70,16 @@ def cleanup_tasks() -> None:
         try:
             atq = subprocess.check_output(["atq"], text=True)
             for line in atq.splitlines():
+                if not line.strip():
+                    continue
                 job_id = line.split()[0]
-                content = subprocess.check_output(["at", "-c", job_id], text=True)
-                if "energy_manager.py" in content or "energy_scheduler.py" in content:
-                    subprocess.run(["atrm", job_id])
-        except:
+                try:
+                    content = subprocess.check_output(["at", "-c", job_id], text=True)
+                    if "energy_manager.py" in content or "energy_scheduler.py" in content or "summer_heater.py" in content:
+                        subprocess.run(["atrm", job_id], capture_output=True)
+                except Exception:
+                    pass
+        except Exception:
             pass
 
 
@@ -236,29 +242,47 @@ def main():
     parser.add_argument("--cleanup", action="store_true", help="Remove all scheduled tasks and exit")
     args = parser.parse_args()
     
-    logger.info("=" * 50)
-    logger.info("######### Energy Scheduler Start ##########")
-    
-    if args.cleanup:
-        logger.info("Cleanup mode - removing all scheduled tasks")
-        cleanup_tasks()
-        logger.info("All tasks removed")
-        return
+    # Lock file - zapobiega równoległym uruchomieniom
+    lock_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".scheduler.lock")
+    lock_fp = open(lock_file_path, "w")
+    try:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        # Inny proces schedulera już działa - wychodzimy cicho
+        lock_fp.close()
+        sys.exit(0)
     
     try:
-        plan_day()
-    except Exception as e:
-        logger.error(f"Scheduler failed: {e}", exc_info=True)
-        # Fallback - podstawowe godziny
-        now = datetime.now(WARSAW_TZ)
-        fallbacks = [
-            (now.replace(hour=7, minute=0), "EnergyMorningSell", ""),
-            (now.replace(hour=12, minute=0), "EnergyMiddayPeriodic", "--periodic --until 17"),
-            (now.replace(hour=17, minute=0), "EnergyEveningPeriodic", "--periodic --until 24"),
-        ]
-        for time, name, args in fallbacks:
-            if time > now:
-                schedule_task(time, name, args=args)
+        logger.info("=" * 50)
+        logger.info("######### Energy Scheduler Start ##########")
+        
+        if args.cleanup:
+            logger.info("Cleanup mode - removing all scheduled tasks")
+            cleanup_tasks()
+            logger.info("All tasks removed")
+            return
+        
+        try:
+            plan_day()
+        except Exception as e:
+            logger.error(f"Scheduler failed: {e}", exc_info=True)
+            # Fallback - podstawowe godziny
+            now = datetime.now(WARSAW_TZ)
+            fallbacks = [
+                (now.replace(hour=7, minute=0), "EnergyMorningSell", ""),
+                (now.replace(hour=12, minute=0), "EnergyMiddayPeriodic", "--periodic --until 17"),
+                (now.replace(hour=17, minute=0), "EnergyEveningPeriodic", "--periodic --until 24"),
+            ]
+            for time, name, fall_args in fallbacks:
+                if time > now:
+                    schedule_task(time, name, args=fall_args)
+    finally:
+        fcntl.flock(lock_fp, fcntl.LOCK_UN)
+        lock_fp.close()
+        try:
+            os.unlink(lock_file_path)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

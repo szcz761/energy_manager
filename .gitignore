@@ -27,3 +27,6 @@ rce_data/rce_pln_current.json
 smart_life/device_detail.json
 smart_life/device_spec.json
 smart_life/snapshot.json
+
+# Lock files (prevent concurrent execution)
+.*.lock

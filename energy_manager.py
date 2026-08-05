@@ -7,6 +7,7 @@ Pogoda wpływa tylko na limit SOC wieczorem.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import logging
 import os
 import platform
@@ -362,20 +363,38 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="Tylko pokaż stan")
     args = parser.parse_args()
     
-    logger.info("######### Energy Manager Start ##########")
-    
-    if args.dry_run:
-        state = get_state()
-        logger.info(f"SOC={state.soc}%, cena={state.rce_price}, wieczór={is_evening()}, SUMMER_MODE={SUMMER_MODE}")
+    # Lock file - zapobiega równoległym uruchomieniom
+    lock_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".energy_manager.lock")
+    lock_fp = open(lock_file_path, "w")
+    try:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        logger.warning("Another energy_manager instance is running - exiting")
+        lock_fp.close()
         sys.exit(0)
     
-    soc = manage_energy()
-    
-    if args.periodic and soc is not None:
-        state = get_state()
-        if should_continue_periodic(state):
-            minutes = calculate_next_check_minutes(state)
-            schedule_next_run(minutes, args.until)
-        else:
-            logger.info("Periodic conditions not met - ending")
-            set_inverter_mode(selling=False)
+    try:
+        logger.info("######### Energy Manager Start ##########")
+        
+        if args.dry_run:
+            state = get_state()
+            logger.info(f"SOC={state.soc}%, cena={state.rce_price}, wieczór={is_evening()}, SUMMER_MODE={SUMMER_MODE}")
+            sys.exit(0)
+        
+        soc = manage_energy()
+        
+        if args.periodic and soc is not None:
+            state = get_state()
+            if should_continue_periodic(state):
+                minutes = calculate_next_check_minutes(state)
+                schedule_next_run(minutes, args.until)
+            else:
+                logger.info("Periodic conditions not met - ending")
+                set_inverter_mode(selling=False)
+    finally:
+        fcntl.flock(lock_fp, fcntl.LOCK_UN)
+        lock_fp.close()
+        try:
+            os.unlink(lock_file_path)
+        except OSError:
+            pass

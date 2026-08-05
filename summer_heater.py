@@ -13,6 +13,7 @@ Uzycie:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import logging
 import os
 import platform
@@ -179,14 +180,32 @@ def main():
     parser.add_argument("--off", action="store_true", help="Turn heater OFF now")
     args = parser.parse_args()
     
-    logger.info("######### Summer Heater Start ##########")
+    # Lock file - zapobiega równoległym uruchomieniom
+    lock_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".summer_heater.lock")
+    lock_fp = open(lock_file_path, "w")
+    try:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        logger.warning("Another summer_heater instance is running - exiting")
+        lock_fp.close()
+        return
     
-    if args.on:
-        heater_on()
-    elif args.off:
-        heater_off()
-    else:
-        plan_summer_heating()
+    try:
+        logger.info("######### Summer Heater Start ##########")
+        
+        if args.on:
+            heater_on()
+        elif args.off:
+            heater_off()
+        else:
+            plan_summer_heating()
+    finally:
+        fcntl.flock(lock_fp, fcntl.LOCK_UN)
+        lock_fp.close()
+        try:
+            os.unlink(lock_file_path)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
