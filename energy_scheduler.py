@@ -222,9 +222,11 @@ def plan_day() -> None:
     logger.info(json.dumps({k: v.strftime('%H:%M') if v else None for k, v in plan.items()}, indent=2))
     
     # 1. Morning sell - pojedyncze uruchomienie
-    if plan["morning_sell"] > now:
+    if MORNING_SELL_ENABLED and plan["morning_sell"] > now:
         schedule_task(plan["morning_sell"], "EnergyMorningSell")
         logger.info(f"Scheduled morning sell: {plan['morning_sell'].strftime('%H:%M')}")
+    elif not MORNING_SELL_ENABLED:
+        logger.info("Morning sell disabled (MORNING_SELL_ENABLED=False)")
     
     # 2. Midday periodic - kontrola grzalki do wieczora
     if plan["midday_start"] > now:

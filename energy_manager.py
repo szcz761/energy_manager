@@ -160,7 +160,10 @@ def get_state() -> EnergyState:
 
 # === Decision helpers ===
 def get_evening_soc_limit(cloud_cover_tomorrow: Optional[float]) -> int:
-    """Limit SOC wieczorem zależny od pogody jutro."""
+    """Limit SOC wieczorem zależny od pogody jutro i MORNING_SELL_ENABLED."""
+    if not MORNING_SELL_ENABLED:
+        # Bez porannej sprzedazy - niższy limit, sprzedajemy więcej wieczorem
+        return 35
     if cloud_cover_tomorrow is None:
         return EVENING_SELL_SOC_DEFAULT
     if cloud_cover_tomorrow < VERY_SUNNY_CLOUD_THRESHOLD:
@@ -292,7 +295,11 @@ def manage_energy() -> Optional[float]:
         return state.soc
     
     # === DAY ===
-    if is_low_price(state.rce_price):
+    if not MORNING_SELL_ENABLED and state.current_hour < EVENING_PEAK_START_HOUR:
+        logger.info(f"DAY - morning sell disabled, not selling (MORNING_SELL_ENABLED=False)")
+        set_inverter_mode(selling=False)
+        control_heater(state)
+    elif is_low_price(state.rce_price):
         logger.info(f"DAY - low price ({state.rce_price:.4f} < {SELL_THRESHOLD}), heater control")
         set_inverter_mode(selling=False)
         control_heater(state)

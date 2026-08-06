@@ -32,35 +32,49 @@ class TestEnergyState:
 class TestGetEveningSocLimit:
     """Tests for get_evening_soc_limit."""
     
+    @patch("energy_manager.MORNING_SELL_ENABLED", True)
     def test_none_cloud_cover(self):
         from energy_manager import get_evening_soc_limit
         assert get_evening_soc_limit(None) == CONFIG.EVENING_SELL_SOC_DEFAULT
     
+    @patch("energy_manager.MORNING_SELL_ENABLED", True)
     def test_very_sunny(self):
         from energy_manager import get_evening_soc_limit
         # Below VERY_SUNNY_CLOUD_THRESHOLD (35)
         assert get_evening_soc_limit(20.0) == CONFIG.EVENING_SELL_SOC_SUNNY
     
+    @patch("energy_manager.MORNING_SELL_ENABLED", True)
     def test_cloudy(self):
         from energy_manager import get_evening_soc_limit
         # Above SUNNY_CLOUD_THRESHOLD (85)
         assert get_evening_soc_limit(90.0) == CONFIG.EVENING_SELL_SOC_CLOUDY
     
+    @patch("energy_manager.MORNING_SELL_ENABLED", True)
     def test_moderate(self):
         from energy_manager import get_evening_soc_limit
         # Between 35 and 85
         assert get_evening_soc_limit(50.0) == CONFIG.EVENING_SELL_SOC_DEFAULT
     
+    @patch("energy_manager.MORNING_SELL_ENABLED", True)
     def test_boundary_very_sunny(self):
         from energy_manager import get_evening_soc_limit
         # Exactly at threshold
         assert get_evening_soc_limit(35.0) == CONFIG.EVENING_SELL_SOC_DEFAULT
     
+    @patch("energy_manager.MORNING_SELL_ENABLED", True)
     def test_boundary_cloudy(self):
         from energy_manager import get_evening_soc_limit
         # Exactly at threshold (> not >=)
         assert get_evening_soc_limit(85.0) == CONFIG.EVENING_SELL_SOC_DEFAULT
         assert get_evening_soc_limit(85.1) == CONFIG.EVENING_SELL_SOC_CLOUDY
+    
+    @patch("energy_manager.MORNING_SELL_ENABLED", False)
+    def test_morning_sell_disabled_returns_35(self):
+        from energy_manager import get_evening_soc_limit
+        # When morning sell disabled, always return 35 regardless of weather
+        assert get_evening_soc_limit(None) == 35
+        assert get_evening_soc_limit(20.0) == 35
+        assert get_evening_soc_limit(90.0) == 35
 
 
 class TestIsLowPrice:
@@ -125,6 +139,7 @@ class TestCalculateNextCheckMinutes:
         assert result == CONFIG.MIN_CHECK_INTERVAL_MINUTES
     
     @patch("energy_manager.is_evening", return_value=True)
+    @patch("energy_manager.MORNING_SELL_ENABLED", True)
     def test_evening_above_limit(self, _):
         from energy_manager import calculate_next_check_minutes, EnergyState
         state = EnergyState(soc=80.0, cloud_cover_tomorrow=50.0)
@@ -186,6 +201,7 @@ class TestManageEnergy:
     @patch("energy_manager.set_inverter_mode")
     @patch("energy_manager.is_evening", return_value=False)
     @patch("energy_manager.get_state")
+    @patch("energy_manager.MORNING_SELL_ENABLED", True)
     def test_day_high_price_sells(self, mock_state, mock_evening, mock_inverter, mock_heater):
         from energy_manager import manage_energy, EnergyState
         mock_state.return_value = EnergyState(soc=60.0, pv_power=3000, rce_price=0.55, current_hour=10)
@@ -193,6 +209,19 @@ class TestManageEnergy:
         assert result == 60.0
         mock_inverter.assert_called_once_with(selling=True)
         mock_heater.assert_not_called()
+    
+    @patch("energy_manager.control_heater")
+    @patch("energy_manager.set_inverter_mode")
+    @patch("energy_manager.is_evening", return_value=False)
+    @patch("energy_manager.get_state")
+    @patch("energy_manager.MORNING_SELL_ENABLED", False)
+    def test_day_high_price_no_sell_when_morning_disabled(self, mock_state, mock_evening, mock_inverter, mock_heater):
+        from energy_manager import manage_energy, EnergyState
+        mock_state.return_value = EnergyState(soc=60.0, pv_power=3000, rce_price=0.55, current_hour=10)
+        result = manage_energy()
+        assert result == 60.0
+        mock_inverter.assert_called_once_with(selling=False)
+        mock_heater.assert_called_once()
     
     @patch("energy_manager.control_heater")
     @patch("energy_manager.set_inverter_mode")

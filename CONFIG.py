@@ -28,6 +28,11 @@ EVENING_SELL_SOC_CLOUDY = 70  # jutro pochmurno - zachowaj więcej
 # Pozwala wylaczyc piec gazowy latem
 SUMMER_MODE = True
 
+# === Poranna sprzedaz ===
+# Gdy False: pomija poranna sprzedaz i obniza wieczorny limit SOC do 35%
+# Przydatne latem gdy bateria nie zdazy sie naladowac do wieczora
+MORNING_SELL_ENABLED = False
+
 # === Retry ===
 API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY_SECONDS = 5

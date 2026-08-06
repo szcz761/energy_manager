@@ -16,9 +16,10 @@ TZ = ZoneInfo("Europe/Warsaw")
 
 
 def make_rce_items(hour_price_pairs: list[tuple[int, float]], date=None) -> list[dict]:
-    """Helper: create RCE API response items from (hour, price_pln_kwh) pairs."""
+    """Helper: create RCE API response items from (hour, price_pln_kwh) pairs.
+    Uses today's date by default so tests work regardless of when they run."""
     if date is None:
-        date = datetime(2026, 8, 5, tzinfo=TZ)
+        date = datetime.now(TZ)
     items = []
     for hour, price_kwh in hour_price_pairs:
         dt = date.replace(hour=hour, minute=0, second=0, microsecond=0)
